@@ -120,54 +120,39 @@ def extract_stream(anime_id, episode_number, audio_type):
         logger.error(f"Stream extraction error: {e}")
         return None, None
 
-def download_with_ffmpeg(stream_url, output_path, headers=None):
-    logger.info("Starting FFmpeg download...")
+def download_with_ytdlp(stream_url, output_path, headers=None):
+    """Use yt-dlp to download the stream robustly."""
+    logger.info("Starting yt-dlp download...")
     
-    user_agent = headers.get("User-Agent", "Mozilla/5.0")
-    referer = headers.get("Referer", "https://megaplay.buzz/")
+    user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
+    referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
 
-    # Primary command: use -user_agent and -referer globally, placed before -i
     cmd = [
-        "ffmpeg",
-        "-user_agent", user_agent,
-        "-referer", referer,
-        "-i", stream_url,
-        "-c", "copy",
-        "-movflags", "+faststart",
-        output_path,
-        "-y"
+        "yt-dlp",
+        "--no-warnings",
+        "--no-check-certificate",
+        "--referer", referer,
+        "--user-agent", user_agent,
+        "-o", output_path,
+        stream_url
     ]
     
-    logger.info("Attempting stream copy (no re-encode)...")
     result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode == 0:
-        logger.info("FFmpeg download (copy) complete.")
-        return True
-
-    # Fallback: re-encode if the stream copy fails (e.g., codec incompatibility)
-    logger.warning(f"FFmpeg copy failed. Error: {result.stderr[-500:]}")
-    logger.info("Attempting fallback with re-encoding...")
-    
-    fallback_cmd = [
-        "ffmpeg",
-        "-user_agent", user_agent,
-        "-referer", referer,
-        "-i", stream_url,
-        "-c:v", "libx264",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        output_path,
-        "-y"
-    ]
-    
-    fallback_result = subprocess.run(fallback_cmd, capture_output=True, text=True)
-    
-    if fallback_result.returncode != 0:
-        logger.error(f"FFmpeg fallback failed. Error: {fallback_result.stderr}")
+    if result.returncode != 0:
+        logger.error(f"yt-dlp error: {result.stderr}")
         return False
     
-    logger.info("FFmpeg download (re-encode fallback) complete.")
+    # yt-dlp might add an extension, so we find the actual downloaded file
+    if not os.path.exists(output_path):
+        # Check if it saved with a different extension (e.g., .webm, .mkv)
+        dir_name = os.path.dirname(output_path)
+        base_name = os.path.basename(output_path).split('.')[0]
+        for f in os.listdir(dir_name):
+            if f.startswith(base_name):
+                os.rename(os.path.join(dir_name, f), output_path)
+                break
+                
+    logger.info("yt-dlp download complete.")
     return True
 
 def send_video_chunked(chat_id, file_path, caption):
@@ -304,8 +289,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         output_file = f"/tmp/anime_{uuid.uuid4().hex}.mp4"
         await query.edit_message_text("⏳ **Downloading and merging...**")
         
-        if not download_with_ffmpeg(stream_url, output_file, headers):
-            await query.edit_message_text("❌ Download failed. FFmpeg error.")
+        if not download_with_ytdlp(stream_url, output_file, headers):
+            await query.edit_message_text("❌ Download failed. yt-dlp error.")
             return
         
         file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
