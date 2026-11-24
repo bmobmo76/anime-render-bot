@@ -122,18 +122,52 @@ def extract_stream(anime_id, episode_number, audio_type):
 
 def download_with_ffmpeg(stream_url, output_path, headers=None):
     logger.info("Starting FFmpeg download...")
-    # REMOVED: -bsf:a aac_adtstoasc (this was causing failures on non-AAC streams)
-    cmd = ["ffmpeg", "-i", stream_url, "-c", "copy", "-movflags", "+faststart", output_path, "-y"]
     
-    if headers:
-        header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
-        cmd = ["ffmpeg", "-headers", header_str, "-i", stream_url, "-c", "copy", "-movflags", "+faststart", output_path, "-y"]
+    user_agent = headers.get("User-Agent", "Mozilla/5.0")
+    referer = headers.get("Referer", "https://megaplay.buzz/")
+
+    # Primary command: use -user_agent and -referer globally, placed before -i
+    cmd = [
+        "ffmpeg",
+        "-user_agent", user_agent,
+        "-referer", referer,
+        "-i", stream_url,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        output_path,
+        "-y"
+    ]
     
+    logger.info("Attempting stream copy (no re-encode)...")
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.error(f"FFmpeg error: {result.stderr}")
+    
+    if result.returncode == 0:
+        logger.info("FFmpeg download (copy) complete.")
+        return True
+
+    # Fallback: re-encode if the stream copy fails (e.g., codec incompatibility)
+    logger.warning(f"FFmpeg copy failed. Error: {result.stderr[-500:]}")
+    logger.info("Attempting fallback with re-encoding...")
+    
+    fallback_cmd = [
+        "ffmpeg",
+        "-user_agent", user_agent,
+        "-referer", referer,
+        "-i", stream_url,
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-movflags", "+faststart",
+        output_path,
+        "-y"
+    ]
+    
+    fallback_result = subprocess.run(fallback_cmd, capture_output=True, text=True)
+    
+    if fallback_result.returncode != 0:
+        logger.error(f"FFmpeg fallback failed. Error: {fallback_result.stderr}")
         return False
-    logger.info("FFmpeg download complete.")
+    
+    logger.info("FFmpeg download (re-encode fallback) complete.")
     return True
 
 def send_video_chunked(chat_id, file_path, caption):
@@ -173,7 +207,6 @@ def build_episode_keyboard(episodes, page=0, per_page=24):
     if row:
         keyboard.append(row)
         
-    # Navigation buttons
     nav_row = []
     if page > 0:
         nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page_{page-1}"))
@@ -232,7 +265,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['selected_title'] = title
         context.user_data['episodes'] = episodes
         
-        # Show first page
         reply_markup = build_episode_keyboard(episodes, page=0)
         await query.edit_message_text(
             f"**{title}**\n\nSelect an episode (Page 1):", 
