@@ -5,7 +5,6 @@ import subprocess
 import uuid
 import requests
 import logging
-import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -121,22 +120,48 @@ def extract_stream(anime_id, episode_number, audio_type):
         logger.error(f"Stream extraction error: {e}")
         return None, None
 
-def download_with_ytdlp(stream_url, output_path, headers=None):
-    """Use yt-dlp to download the stream robustly, forcing MP4 format."""
-    logger.info("Starting yt-dlp download...")
-    
+def download_with_ffmpeg(stream_url, output_path, headers=None):
+    """Fallback downloader using FFmpeg with Origin header."""
+    logger.info("Starting FFmpeg fallback download...")
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
     referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
+    origin = referer.rstrip('/')
 
-    # Force MP4 output to ensure Telegram compatibility
+    cmd = [
+        "ffmpeg",
+        "-user_agent", user_agent,
+        "-referer", referer,
+        "-headers", f"Origin: {origin}\r\n",
+        "-i", stream_url,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        output_path,
+        "-y"
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"FFmpeg fallback error: {result.stderr[-500:]}")
+        return False
+    logger.info("FFmpeg fallback download complete.")
+    return True
+
+def download_with_ytdlp(stream_url, output_path, headers=None):
+    """Use yt-dlp to download the stream robustly with Origin headers."""
+    logger.info("Starting yt-dlp download...")
+    user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
+    referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
+    origin = referer.rstrip('/')
+
+    # Use --add-header for Origin, and simplified format selection
     cmd = [
         "yt-dlp",
         "--no-warnings",
         "--no-check-certificate",
         "--referer", referer,
         "--user-agent", user_agent,
+        "--add-header", f"Origin:{origin}",
         "--merge-output-format", "mp4",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "-o", output_path,
         stream_url
     ]
@@ -144,9 +169,9 @@ def download_with_ytdlp(stream_url, output_path, headers=None):
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         logger.error(f"yt-dlp error: {result.stderr}")
-        return False
+        return download_with_ffmpeg(stream_url, output_path, headers)
     
-    # yt-dlp might add an extension, so we find the actual downloaded file
+    # Handle potential extension changes
     if not os.path.exists(output_path):
         dir_name = os.path.dirname(output_path)
         base_name = os.path.basename(output_path).split('.')[0]
@@ -159,11 +184,6 @@ def download_with_ytdlp(stream_url, output_path, headers=None):
     return True
 
 def send_video_chunked(chat_id, file_path, caption):
-    """
-    Upload a video using Telegram's chunked upload, then send it.
-    Uses a long timeout to account for Telegram's video processing time.
-    Falls back to sendDocument if sendVideo fails.
-    """
     logger.info("Starting chunked upload to Telegram...")
     chunk_size = 5 * 1024 * 1024
     file_size = os.path.getsize(file_path)
@@ -174,17 +194,15 @@ def send_video_chunked(chat_id, file_path, caption):
         with open(file_path, "rb") as f:
             f.seek(part_number * chunk_size)
             chunk = f.read(chunk_size)
-            if not chunk:
-                continue
+            if not chunk: continue
                 
             data = {"part_number": str(part_number), "total_parts": str(total_parts)}
-            if file_id: 
-                data["file_id"] = file_id
+            if file_id: data["file_id"] = file_id
                 
             files = {"file": (f"part_{part_number}.mp4", chunk, "application/octet-stream")}
             
             try:
-                resp = requests.post(f"{TELEGRAM_API}/uploadFile", data=data, files=files, timeout=300) # 5-minute timeout
+                resp = requests.post(f"{TELEGRAM_API}/uploadFile", data=data, files=files, timeout=300)
                 resp.raise_for_status()
                 result = resp.json()
                 if not result.get("ok"):
@@ -196,20 +214,13 @@ def send_video_chunked(chat_id, file_path, caption):
                 logger.error(f"Upload part {part_number} failed: {e}")
                 return False
 
-    # Now send the video using the file_id
     logger.info("Upload complete. Sending video...")
     try:
         send_resp = requests.post(
             f"{TELEGRAM_API}/sendVideo",
-            data={
-                "chat_id": chat_id,
-                "video": file_id,
-                "caption": caption,
-                "supports_streaming": "true"
-            },
-            timeout=300 # 5-minute timeout for transcoding
+            data={"chat_id": chat_id, "video": file_id, "caption": caption, "supports_streaming": "true"},
+            timeout=300
         )
-        
         if send_resp.ok:
             logger.info("Video sent successfully.")
             return True
@@ -218,15 +229,10 @@ def send_video_chunked(chat_id, file_path, caption):
     except Exception as e:
         logger.error(f"sendVideo request failed: {e}. Trying sendDocument fallback...")
 
-    # Fallback: send as document if video sending fails
     try:
         doc_resp = requests.post(
             f"{TELEGRAM_API}/sendDocument",
-            data={
-                "chat_id": chat_id,
-                "document": file_id,
-                "caption": caption
-            },
+            data={"chat_id": chat_id, "document": file_id, "caption": caption},
             timeout=300
         )
         if doc_resp.ok:
@@ -353,7 +359,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⏳ **Downloading and merging...**")
         
         if not download_with_ytdlp(stream_url, output_file, headers):
-            await query.edit_message_text("❌ Download failed. yt-dlp error.")
+            await query.edit_message_text("❌ Download failed. Both yt-dlp and FFmpeg fallback failed.")
             return
         
         file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
