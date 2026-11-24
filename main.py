@@ -4,7 +4,6 @@ import math
 import subprocess
 import uuid
 import re
-import json
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -18,7 +17,9 @@ if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN is not set.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+ANILIST_URL = "https://graphql.anilist.co"
 ANIKOTO_BASE = "https://anikotoapi.site"
+ANIKOTO_SITE = "https://anikototv.to"
 
 # --- Helper Functions ---
 
@@ -28,27 +29,72 @@ def send_message(chat_id, text):
     except Exception as e:
         print(f"send_message error: {e}", file=sys.stderr)
 
-def search_anikoto(query):
-    """Search anime using the Anikoto API's search endpoint."""
+def search_anilist(query):
+    """Search anime using AniList GraphQL API (reliable search engine)."""
+    gql = """
+    query ($search: String) {
+      Page(page: 1, perPage: 10) {
+        media(search: $search, type: ANIME, sort: POPULARITY_DESC) {
+          id
+          title { romaji english }
+          episodes
+          status
+          seasonYear
+        }
+      }
+    }
+    """
+    variables = {"search": query}
     try:
-        # The API supports a /search endpoint
-        resp = requests.get(f"{ANIKOTO_BASE}/search", params={"q": query}, timeout=15)
+        resp = requests.post(ANILIST_URL, json={"query": gql, "variables": variables}, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        # Handle different possible response structures
-        if isinstance(data, dict):
-            items = data.get("results", data.get("data", []))
-        elif isinstance(data, list):
-            items = data
-        else:
-            items = []
-        return items[:5]
+        return data.get("data", {}).get("Page", {}).get("media", [])
     except Exception as e:
-        print(f"Anikoto search error: {e}", file=sys.stderr)
+        print(f"AniList search error: {e}", file=sys.stderr)
         return []
 
+def find_anikoto_series(title, year=None):
+    """Scrape Anikoto website search to find the series ID."""
+    try:
+        # Anikoto search URL
+        search_url = f"{ANIKOTO_SITE}/search"
+        params = {"keyword": title}
+        if year:
+            params["year"] = year
+            
+        resp = requests.get(search_url, params=params, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        html = resp.text
+        
+        # Look for series links: /watch/<slug> or /series/<id>
+        # Pattern 1: href="/watch/slug"
+        watch_matches = re.findall(r'href="(/watch/[^"]+)"', html)
+        if watch_matches:
+            # Usually the first result is the best match
+            slug_url = f"{ANIKOTO_SITE}{watch_matches[0]}"
+            # Now fetch that page to find the actual ID or embed
+            page = requests.get(slug_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            page.raise_for_status()
+            # Look for an ID pattern in the page (e.g., data-id, or /series/123)
+            id_matches = re.findall(r'/series/(\d+)', page.text)
+            if id_matches:
+                return id_matches[0]
+            # Fallback: use the slug directly if the API accepts it
+            return watch_matches[0].split("/")[-1]
+            
+        # Pattern 2: direct /series/ID links on the search page
+        series_matches = re.findall(r'/series/(\d+)', html)
+        if series_matches:
+            return series_matches[0]
+            
+        return None
+    except Exception as e:
+        print(f"Anikoto scrape error: {e}", file=sys.stderr)
+        return None
+
 def get_episodes(series_id):
-    """Fetch the complete episode list for a series."""
+    """Fetch the complete episode list for a series from the Anikoto API."""
     try:
         resp = requests.get(f"{ANIKOTO_BASE}/series/{series_id}", timeout=15)
         resp.raise_for_status()
@@ -66,7 +112,7 @@ def extract_stream_url(series_id, episode_num, audio_type):
     episodes = get_episodes(series_id)
     if not episodes:
         return None, None
-    
+        
     target_ep = next((ep for ep in episodes if str(ep.get("number", "")) == str(episode_num)), None)
     if not target_ep:
         return None, None
@@ -82,12 +128,10 @@ def extract_stream_url(series_id, episode_num, audio_type):
         page.raise_for_status()
         html = page.text
         
-        # Look for the m3u8 stream URL
         m3u8_matches = re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', html)
         if m3u8_matches:
             return m3u8_matches[0], {"Referer": "https://megaplay.buzz/"}
             
-        # Fallback: look for file: "..." pattern
         file_matches = re.findall(r'file\s*:\s*["\']([^"\']+)["\']', html)
         if file_matches:
             return file_matches[0], {"Referer": "https://megaplay.buzz/"}
@@ -135,50 +179,58 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
     await update.message.reply_text(f"🔍 Searching for **{query}**...")
     
-    results = search_anikoto(query)
+    # 1. Search AniList for the anime
+    results = search_anilist(query)
     if not results:
-        await update.message.reply_text("❌ No results found. Try a different name.")
+        await update.message.reply_text("❌ No results found on AniList. Try a different name.")
         return
     
-    context.user_data['search_results'] = results
+    context.user_data['anilist_results'] = results
     keyboard = []
-    for i, anime in enumerate(results):
-        title = anime.get('title', f'Result {i+1}')
-        keyboard.append([InlineKeyboardButton(title, callback_data=f"anime_{i}")])
+    for i, media in enumerate(results):
+        title = media.get("title", {}).get("english") or media.get("title", {}).get("romaji") or f"Result {i+1}"
+        year = media.get("seasonYear", "")
+        label = f"{title} ({year})" if year else title
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"anilist_{i}")])
     
-    await update.message.reply_text("Select an anime:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Select an anime from AniList:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    if data.startswith("anime_"):
+    if data.startswith("anilist_"):
         index = int(data.split("_")[1])
-        anime = context.user_data['search_results'][index]
-        series_id = anime.get('id') or anime.get('series_id')
-        title = anime.get('title', 'Anime')
+        media = context.user_data['anilist_results'][index]
+        title = media.get("title", {}).get("english") or media.get("title", {}).get("romaji")
+        year = media.get("seasonYear")
         
-        await query.edit_message_text(f"📺 **{title}**\n\nFetching episode list...")
+        await query.edit_message_text(f"📺 **{title}**\n\nMapping to Anikoto source...")
         
-        episodes = get_episodes(series_id)
-        if not episodes:
-            await query.edit_message_text("❌ No episodes found for this anime. The season may not have started airing yet.")
+        # 2. Find the Anikoto series ID by scraping the site
+        series_id = find_anikoto_series(title, year)
+        if not series_id:
+            await query.edit_message_text(f"❌ Found on AniList, but could not find a matching Anikoto source for **{title}**. The site may be down or the anime is not hosted there.")
             return
         
         context.user_data['series_id'] = series_id
         context.user_data['selected_title'] = title
-        context.user_data['episodes'] = episodes
         
-        # Build episode buttons (showing first 24 to fit Telegram limits)
+        # 3. Fetch episodes
+        episodes = get_episodes(series_id)
+        if not episodes:
+            await query.edit_message_text(f"❌ Found Anikoto source, but it has no episode list yet. The season may not have started airing.")
+            return
+        
+        context.user_data['episodes'] = episodes
         keyboard = []
         row = []
         for ep in episodes[:24]:
             ep_num = ep.get('number', '?')
             row.append(InlineKeyboardButton(f"EP {ep_num}", callback_data=f"ep_{ep_num}"))
             if len(row) == 4:
-                keyboard.append(row)
-                row = []
+                keyboard.append(row); row = []
         if row: keyboard.append(row)
         
         await query.edit_message_text(f"**{title}**\n\nSelect an episode ({len(episodes)} total):", reply_markup=InlineKeyboardMarkup(keyboard))
