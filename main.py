@@ -44,11 +44,9 @@ def get_text(item):
     if isinstance(item, str):
         return item
     if isinstance(item, dict):
-        # Try common keys first, then fallback to any string value
         for key in ["en", "english", "romaji", "name", "title"]:
             if key in item and isinstance(item[key], str):
                 return item[key]
-        # Fallback: just grab the first string value
         for val in item.values():
             if isinstance(val, str):
                 return val
@@ -60,7 +58,7 @@ def search_kuhi(query):
         resp = requests.get(f"{KUHI_API}/anime/search", params={"query": query, "page": 1, "per_page": 10}, timeout=20)
         resp.raise_for_status()
         data = resp.json()
-        results = data if isinstance(data, list) else data.get("results", [])
+        results = data.get("results", [])
         logger.info(f"Search returned {len(results)} results")
         return results
     except Exception as e:
@@ -68,12 +66,27 @@ def search_kuhi(query):
         return []
 
 def get_episodes(anime_id):
+    """Fetch episode list using the correct Kuhi endpoint: /anime/episodes/{id}."""
     logger.info(f"Fetching episodes for anime ID: {anime_id}")
     try:
-        resp = requests.get(f"{KUHI_API}/anime/{anime_id}/episodes", timeout=20)
+        resp = requests.get(f"{KUHI_API}/anime/episodes/{anime_id}", timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        episodes = data.get("episodes", [])
+        
+        # The Kuhi API returns episodes grouped by provider and audio type.
+        # We need to flatten this into a simple list of episode numbers.
+        episodes_set = set()
+        providers = data.get("providers", {})
+        for provider_data in providers.values():
+            ep_data = provider_data.get("episodes", {})
+            for audio in ["sub", "dub"]:
+                for ep in ep_data.get(audio, []):
+                    if isinstance(ep, dict) and "number" in ep:
+                        episodes_set.add(ep["number"])
+                    elif isinstance(ep, int):
+                        episodes_set.add(ep)
+        
+        episodes = sorted(list(episodes_set))
         logger.info(f"Fetched {len(episodes)} episodes")
         return episodes
     except Exception as e:
@@ -81,22 +94,32 @@ def get_episodes(anime_id):
         return []
 
 def extract_stream(anime_id, episode_number, audio_type):
+    """Extract stream using the correct Kuhi endpoint: /anime/extract/{id}?e={ep}&type={sub|dub}."""
     logger.info(f"Extracting stream for {anime_id} EP {episode_number} ({audio_type})")
     try:
-        params = {"anime_id": anime_id, "episode": episode_number, "type": audio_type}
-        resp = requests.get(f"{KUHI_API}/extract", params=params, timeout=60)
+        params = {"e": episode_number, "type": audio_type}
+        resp = requests.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=60)
         resp.raise_for_status()
         data = resp.json()
         
-        stream_url = data.get("url") or data.get("stream_url")
-        headers = data.get("headers", {"Referer": "https://megaplay.buzz/"})
-        
-        if stream_url:
-            logger.info(f"Stream URL found: {stream_url[:80]}...")
-            return stream_url, headers
-        else:
-            logger.warning("No stream URL in response.")
+        streams = data.get("streams", [])
+        if not streams:
+            logger.warning("No streams found in response.")
             return None, None
+        
+        # Pick the first HLS stream
+        for stream in streams:
+            if stream.get("type") == "hls":
+                stream_url = stream.get("url")
+                headers = {"Referer": stream.get("referer", "https://megaplay.buzz/")}
+                logger.info(f"Stream URL found: {stream_url[:80]}...")
+                return stream_url, headers
+        
+        # Fallback to first stream of any type
+        stream = streams[0]
+        stream_url = stream.get("url")
+        headers = {"Referer": stream.get("referer", "https://megaplay.buzz/")}
+        return stream_url, headers
     except Exception as e:
         logger.error(f"Stream extraction error: {e}")
         return None, None
@@ -153,7 +176,6 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['search_results'] = results
     keyboard = []
     for i, anime in enumerate(results):
-        # Use the safe get_text helper here
         raw_title = anime.get('title') or anime.get('name') or f"Result {i+1}"
         title = get_text(raw_title)
         keyboard.append([InlineKeyboardButton(title, callback_data=f"anime_{i}")])
@@ -186,8 +208,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard = []
         row = []
-        for ep in episodes[:24]:
-            ep_num = ep.get('number') or ep.get('episode')
+        for ep_num in episodes[:24]:
             row.append(InlineKeyboardButton(f"EP {ep_num}", callback_data=f"ep_{ep_num}"))
             if len(row) == 4:
                 keyboard.append(row); row = []
@@ -233,7 +254,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(output_file): os.remove(output_file)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and send a message to the user so they aren't left hanging."""
     logger.error(f"Update {update} caused error {context.error}")
     if isinstance(update, Update) and update.effective_message:
         try:
@@ -248,8 +268,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_anime))
     app.add_handler(CallbackQueryHandler(button_handler))
-    
-    # Register the error handler
     app.add_error_handler(error_handler)
 
     webhook_url = f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}"
