@@ -30,7 +30,6 @@ def send_message(chat_id, text):
         print(f"send_message error: {e}", file=sys.stderr)
 
 def search_anilist(query):
-    """Search anime using AniList GraphQL API (reliable search engine)."""
     gql = """
     query ($search: String) {
       Page(page: 1, perPage: 10) {
@@ -55,46 +54,58 @@ def search_anilist(query):
         return []
 
 def find_anikoto_series(title, year=None):
-    """Scrape Anikoto website search to find the series ID."""
+    """
+    Correctly search Anikoto using its internal AJAX endpoint.
+    Flow: /ajax/anime/search?keyword=... -> parse /watch/<slug> -> get data-id.
+    """
     try:
-        # Anikoto search URL
-        search_url = f"{ANIKOTO_SITE}/search"
+        # 1. Use the AJAX search endpoint
+        search_url = f"{ANIKOTO_SITE}/ajax/anime/search"
         params = {"keyword": title}
-        if year:
-            params["year"] = year
-            
-        resp = requests.get(search_url, params=params, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "text/html, */*; q=0.01",
+            "Referer": f"{ANIKOTO_SITE}/home"
+        }
+        resp = requests.get(search_url, params=params, headers=headers, timeout=15)
         resp.raise_for_status()
-        html = resp.text
         
-        # Look for series links: /watch/<slug> or /series/<id>
-        # Pattern 1: href="/watch/slug"
-        watch_matches = re.findall(r'href="(/watch/[^"]+)"', html)
-        if watch_matches:
-            # Usually the first result is the best match
-            slug_url = f"{ANIKOTO_SITE}{watch_matches[0]}"
-            # Now fetch that page to find the actual ID or embed
-            page = requests.get(slug_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            page.raise_for_status()
-            # Look for an ID pattern in the page (e.g., data-id, or /series/123)
-            id_matches = re.findall(r'/series/(\d+)', page.text)
-            if id_matches:
-                return id_matches[0]
-            # Fallback: use the slug directly if the API accepts it
-            return watch_matches[0].split("/")[-1]
+        # 2. Parse the response for /watch/ links
+        # The response is HTML containing <a href="/watch/slug">...</a>
+        watch_matches = re.findall(r'href="(/watch/[^"]+)"', resp.text)
+        if not watch_matches:
+            print("No /watch/ links found in search response.", file=sys.stderr)
+            return None
             
-        # Pattern 2: direct /series/ID links on the search page
-        series_matches = re.findall(r'/series/(\d+)', html)
-        if series_matches:
-            return series_matches[0]
+        # 3. Take the first result and fetch its watch page
+        slug_url = f"{ANIKOTO_SITE}{watch_matches[0]}"
+        print(f"Fetching watch page: {slug_url}", file=sys.stderr)
+        
+        page = requests.get(slug_url, headers=headers, timeout=15)
+        page.raise_for_status()
+        
+        # 4. Extract the numeric data-id from #watch-main
+        # Example: <div id="watch-main" data-id="12345" ...>
+        id_match = re.search(r'id="watch-main"[^>]*data-id="(\d+)"', page.text)
+        if id_match:
+            return id_match.group(1)
             
+        # Fallback: look for any /series/123 link on the page
+        series_match = re.search(r'/series/(\d+)', page.text)
+        if series_match:
+            return series_match.group(1)
+            
+        # Fallback: look for data-url which might contain the slug, but the API needs a numeric ID.
+        # If we can't find a numeric ID, we fail gracefully.
+        print("Could not extract numeric data-id from watch page.", file=sys.stderr)
         return None
+        
     except Exception as e:
         print(f"Anikoto scrape error: {e}", file=sys.stderr)
         return None
 
 def get_episodes(series_id):
-    """Fetch the complete episode list for a series from the Anikoto API."""
     try:
         resp = requests.get(f"{ANIKOTO_BASE}/series/{series_id}", timeout=15)
         resp.raise_for_status()
@@ -108,7 +119,6 @@ def get_episodes(series_id):
         return []
 
 def extract_stream_url(series_id, episode_num, audio_type):
-    """Extract the HLS stream URL for a specific episode."""
     episodes = get_episodes(series_id)
     if not episodes:
         return None, None
@@ -179,7 +189,6 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
     await update.message.reply_text(f"🔍 Searching for **{query}**...")
     
-    # 1. Search AniList for the anime
     results = search_anilist(query)
     if not results:
         await update.message.reply_text("❌ No results found on AniList. Try a different name.")
@@ -208,19 +217,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(f"📺 **{title}**\n\nMapping to Anikoto source...")
         
-        # 2. Find the Anikoto series ID by scraping the site
         series_id = find_anikoto_series(title, year)
         if not series_id:
-            await query.edit_message_text(f"❌ Found on AniList, but could not find a matching Anikoto source for **{title}**. The site may be down or the anime is not hosted there.")
+            await query.edit_message_text(f"❌ Could not find a matching source for **{title}** on Anikoto. The site may be down or the anime is not hosted there.")
             return
         
         context.user_data['series_id'] = series_id
         context.user_data['selected_title'] = title
         
-        # 3. Fetch episodes
         episodes = get_episodes(series_id)
         if not episodes:
-            await query.edit_message_text(f"❌ Found Anikoto source, but it has no episode list yet. The season may not have started airing.")
+            await query.edit_message_text(f"❌ Found source, but it has no episode list yet. The season may not have started airing.")
             return
         
         context.user_data['episodes'] = episodes
