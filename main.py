@@ -29,7 +29,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # --- Your Personal Kuhi API URL ---
 # REPLACE THE URL BELOW WITH YOUR DEPLOYED KUHI API URL
-KUHI_API = "https://my-kuhi-api.onrender.com"
+KUHI_API = "https://my-kuhi-api.onrender.com" # <--- MAKE SURE THIS IS YOUR URL
 
 # --- Helper Functions ---
 
@@ -39,13 +39,27 @@ def send_message(chat_id, text):
     except Exception as e:
         logger.error(f"send_message error: {e}")
 
+def get_text(item):
+    """Safely extract a string from a dict or string title."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        # Try common keys first, then fallback to any string value
+        for key in ["en", "english", "romaji", "name", "title"]:
+            if key in item and isinstance(item[key], str):
+                return item[key]
+        # Fallback: just grab the first string value
+        for val in item.values():
+            if isinstance(val, str):
+                return val
+    return "Unknown Title"
+
 def search_kuhi(query):
     logger.info(f"Searching Kuhi for: {query}")
     try:
         resp = requests.get(f"{KUHI_API}/anime/search", params={"query": query, "page": 1, "per_page": 10}, timeout=20)
         resp.raise_for_status()
         data = resp.json()
-        # Kuhi returns a list of results directly or inside a 'results' key
         results = data if isinstance(data, list) else data.get("results", [])
         logger.info(f"Search returned {len(results)} results")
         return results
@@ -69,13 +83,8 @@ def get_episodes(anime_id):
 def extract_stream(anime_id, episode_number, audio_type):
     logger.info(f"Extracting stream for {anime_id} EP {episode_number} ({audio_type})")
     try:
-        # Kuhi's extract endpoint races all providers and returns the fastest working stream
-        params = {
-            "anime_id": anime_id,
-            "episode": episode_number,
-            "type": audio_type  # 'sub' or 'dub'
-        }
-        resp = requests.get(f"{KUHI_API}/extract", params=params, timeout=45)
+        params = {"anime_id": anime_id, "episode": episode_number, "type": audio_type}
+        resp = requests.get(f"{KUHI_API}/extract", params=params, timeout=60)
         resp.raise_for_status()
         data = resp.json()
         
@@ -144,7 +153,9 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['search_results'] = results
     keyboard = []
     for i, anime in enumerate(results):
-        title = anime.get('title') or anime.get('name', f'Result {i+1}')
+        # Use the safe get_text helper here
+        raw_title = anime.get('title') or anime.get('name') or f"Result {i+1}"
+        title = get_text(raw_title)
         keyboard.append([InlineKeyboardButton(title, callback_data=f"anime_{i}")])
     
     await update.message.reply_text("Select an anime:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -158,7 +169,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         index = int(data.split("_")[1])
         anime = context.user_data['search_results'][index]
         anime_id = anime.get('id') or anime.get('anime_id')
-        title = anime.get('title') or anime.get('name', 'Anime')
+        
+        raw_title = anime.get('title') or anime.get('name') or "Anime"
+        title = get_text(raw_title)
         
         await query.edit_message_text(f"📺 **{title}**\n\nFetching episode list...")
         
@@ -219,6 +232,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if os.path.exists(output_file): os.remove(output_file)
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and send a message to the user so they aren't left hanging."""
+    logger.error(f"Update {update} caused error {context.error}")
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(f"⚠️ An error occurred: {str(context.error)[:200]}")
+        except Exception:
+            pass
+
 # --- Main Entry Point ---
 
 def main():
@@ -226,6 +248,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_anime))
     app.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Register the error handler
+    app.add_error_handler(error_handler)
 
     webhook_url = f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}"
     app.run_webhook(
