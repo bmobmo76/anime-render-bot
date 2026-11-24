@@ -3,24 +3,22 @@ import sys
 import math
 import subprocess
 import uuid
+import re
+import json
 import requests
-import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-
-# --- Import anikoto library ---
-try:
-    import anikoto
-except ImportError:
-    print("anikoto library not found. Make sure it is in requirements.txt", file=sys.stderr)
-    sys.exit(1)
 
 # --- Environment Variables ---
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", 8080))
 
+if not BOT_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN is not set.")
+
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+ANIKOTO_BASE = "https://anikotoapi.site"
 
 # --- Helper Functions ---
 
@@ -30,10 +28,78 @@ def send_message(chat_id, text):
     except Exception as e:
         print(f"send_message error: {e}", file=sys.stderr)
 
+def search_anikoto(query):
+    """Search anime using the Anikoto API's search endpoint."""
+    try:
+        # The API supports a /search endpoint
+        resp = requests.get(f"{ANIKOTO_BASE}/search", params={"q": query}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        # Handle different possible response structures
+        if isinstance(data, dict):
+            items = data.get("results", data.get("data", []))
+        elif isinstance(data, list):
+            items = data
+        else:
+            items = []
+        return items[:5]
+    except Exception as e:
+        print(f"Anikoto search error: {e}", file=sys.stderr)
+        return []
+
+def get_episodes(series_id):
+    """Fetch the complete episode list for a series."""
+    try:
+        resp = requests.get(f"{ANIKOTO_BASE}/series/{series_id}", timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict) and "data" in data:
+            data = data["data"]
+        episodes = data.get("episodes", [])
+        return episodes
+    except Exception as e:
+        print(f"Episode fetch error: {e}", file=sys.stderr)
+        return []
+
+def extract_stream_url(series_id, episode_num, audio_type):
+    """Extract the HLS stream URL for a specific episode."""
+    episodes = get_episodes(series_id)
+    if not episodes:
+        return None, None
+    
+    target_ep = next((ep for ep in episodes if str(ep.get("number", "")) == str(episode_num)), None)
+    if not target_ep:
+        return None, None
+        
+    embed_id = target_ep.get("embed_id") or target_ep.get("id")
+    if not embed_id:
+        return None, None
+        
+    embed_url = f"https://megaplay.buzz/stream/s-2/{embed_id}/{audio_type}"
+    
+    try:
+        page = requests.get(embed_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        page.raise_for_status()
+        html = page.text
+        
+        # Look for the m3u8 stream URL
+        m3u8_matches = re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', html)
+        if m3u8_matches:
+            return m3u8_matches[0], {"Referer": "https://megaplay.buzz/"}
+            
+        # Fallback: look for file: "..." pattern
+        file_matches = re.findall(r'file\s*:\s*["\']([^"\']+)["\']', html)
+        if file_matches:
+            return file_matches[0], {"Referer": "https://megaplay.buzz/"}
+            
+        return None, None
+    except Exception as e:
+        print(f"Stream extraction error: {e}", file=sys.stderr)
+        return None, None
+
 def download_with_ffmpeg(stream_url, output_path, headers=None):
     cmd = ["ffmpeg", "-i", stream_url, "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", output_path, "-y"]
     if headers:
-        # Some streams require specific headers (like Referer)
         header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
         cmd = ["ffmpeg", "-headers", header_str, "-i", stream_url, "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", output_path, "-y"]
     
@@ -69,25 +135,18 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
     await update.message.reply_text(f"🔍 Searching for **{query}**...")
     
-    try:
-        # Search using anikoto library (runs in executor to avoid blocking)
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(None, anikoto.search, query)
-        
-        if not results:
-            await update.message.reply_text("❌ No results found. Try a different name.")
-            return
-        
-        context.user_data['search_results'] = results[:5]
-        keyboard = []
-        for i, anime in enumerate(results[:5]):
-            title = anime.get('title', f'Result {i+1}')
-            keyboard.append([InlineKeyboardButton(title, callback_data=f"anime_{i}")])
-        
-        await update.message.reply_text("Select an anime:", reply_markup=InlineKeyboardMarkup(keyboard))
-    except Exception as e:
-        print(f"Search error: {e}", file=sys.stderr)
-        await update.message.reply_text("❌ Search failed. The source may be down.")
+    results = search_anikoto(query)
+    if not results:
+        await update.message.reply_text("❌ No results found. Try a different name.")
+        return
+    
+    context.user_data['search_results'] = results
+    keyboard = []
+    for i, anime in enumerate(results):
+        title = anime.get('title', f'Result {i+1}')
+        keyboard.append([InlineKeyboardButton(title, callback_data=f"anime_{i}")])
+    
+    await update.message.reply_text("Select an anime:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -97,39 +156,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("anime_"):
         index = int(data.split("_")[1])
         anime = context.user_data['search_results'][index]
-        anime_url = anime.get('url') or anime.get('link')
+        series_id = anime.get('id') or anime.get('series_id')
         title = anime.get('title', 'Anime')
         
         await query.edit_message_text(f"📺 **{title}**\n\nFetching episode list...")
         
-        try:
-            # Fetch episodes using anikoto library
-            loop = asyncio.get_event_loop()
-            episodes = await loop.run_in_executor(None, anikoto.get_episodes, anime_url)
-            
-            if not episodes:
-                await query.edit_message_text("❌ No episodes found for this anime.")
-                return
-            
-            context.user_data['anime_url'] = anime_url
-            context.user_data['selected_title'] = title
-            context.user_data['episodes'] = episodes
-            
-            # Build episode buttons (paginated to fit Telegram limits, showing first 24)
-            keyboard = []
-            row = []
-            for ep in episodes[:24]:
-                ep_num = ep.get('number', '?')
-                row.append(InlineKeyboardButton(f"EP {ep_num}", callback_data=f"ep_{ep_num}"))
-                if len(row) == 4:
-                    keyboard.append(row)
-                    row = []
-            if row: keyboard.append(row)
-            
-            await query.edit_message_text(f"**{title}**\n\nSelect an episode ({len(episodes)} total):", reply_markup=InlineKeyboardMarkup(keyboard))
-        except Exception as e:
-            print(f"Episode fetch error: {e}", file=sys.stderr)
-            await query.edit_message_text(f"❌ Failed to fetch episodes: {str(e)[:100]}")
+        episodes = get_episodes(series_id)
+        if not episodes:
+            await query.edit_message_text("❌ No episodes found for this anime. The season may not have started airing yet.")
+            return
+        
+        context.user_data['series_id'] = series_id
+        context.user_data['selected_title'] = title
+        context.user_data['episodes'] = episodes
+        
+        # Build episode buttons (showing first 24 to fit Telegram limits)
+        keyboard = []
+        row = []
+        for ep in episodes[:24]:
+            ep_num = ep.get('number', '?')
+            row.append(InlineKeyboardButton(f"EP {ep_num}", callback_data=f"ep_{ep_num}"))
+            if len(row) == 4:
+                keyboard.append(row)
+                row = []
+        if row: keyboard.append(row)
+        
+        await query.edit_message_text(f"**{title}**\n\nSelect an episode ({len(episodes)} total):", reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data.startswith("ep_"):
         context.user_data['selected_ep'] = data.split("_")[1]
@@ -138,54 +190,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("audio_"):
         audio_type = data.split("_")[1]
-        anime_url = context.user_data['anime_url']
+        series_id = context.user_data['series_id']
         title = context.user_data['selected_title']
         ep_num = context.user_data['selected_ep']
         chat_id = query.message.chat_id
         
         await query.edit_message_text("⏳ **Extracting stream...**")
         
-        try:
-            # Extract stream using anikoto library
-            loop = asyncio.get_event_loop()
-            stream_info = await loop.run_in_executor(None, anikoto.get_stream_url, anime_url, ep_num, audio_type)
-            
-            # The library usually returns a dict with 'url' and 'headers' or just a url string
-            if isinstance(stream_info, dict):
-                stream_url = stream_info.get('url') or stream_info.get('stream_url')
-                headers = stream_info.get('headers', {})
-            else:
-                stream_url = stream_info
-                headers = {"Referer": "https://megaplay.buzz/"}
-            
-            if not stream_url:
-                await query.edit_message_text("❌ Could not extract stream URL. The source may be down or the episode is not yet released in that audio type.")
-                return
-            
-            output_file = f"/tmp/anime_{uuid.uuid4().hex}.mp4"
-            await query.edit_message_text("⏳ **Downloading and merging...**")
-            
-            # Run download in executor so it doesn't block the webhook
-            success = await loop.run_in_executor(None, download_with_ffmpeg, stream_url, output_file, headers)
-            
-            if not success:
-                await query.edit_message_text("❌ Download failed. The stream server might be blocking requests.")
-                return
-            
-            file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
-            await query.edit_message_text(f"📤 **Uploading ({file_size_mb:.1f} MB)...**")
-            
-            caption = f"**{title}** — EP {ep_num} ({audio_type.upper()})"
-            if send_video_chunked(chat_id, output_file, caption):
-                await query.edit_message_text("✅ Done.")
-            else:
-                await query.edit_message_text("❌ Upload failed.")
-            
-            if os.path.exists(output_file): os.remove(output_file)
-            
-        except Exception as e:
-            print(f"Download error: {e}", file=sys.stderr)
-            await query.edit_message_text(f"❌ Error: {str(e)[:100]}")
+        stream_url, headers = extract_stream_url(series_id, ep_num, audio_type)
+        if not stream_url:
+            await query.edit_message_text("❌ Could not extract stream URL. The source may be down or the episode is not yet released in that audio type.")
+            return
+        
+        output_file = f"/tmp/anime_{uuid.uuid4().hex}.mp4"
+        await query.edit_message_text("⏳ **Downloading and merging...**")
+        
+        if not download_with_ffmpeg(stream_url, output_file, headers):
+            await query.edit_message_text("❌ Download failed. FFmpeg error.")
+            return
+        
+        file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
+        await query.edit_message_text(f"📤 **Uploading ({file_size_mb:.1f} MB)...**")
+        
+        caption = f"**{title}** — EP {ep_num} ({audio_type.upper()})"
+        if send_video_chunked(chat_id, output_file, caption):
+            await query.edit_message_text("✅ Done.")
+        else:
+            await query.edit_message_text("❌ Upload failed.")
+        
+        if os.path.exists(output_file): os.remove(output_file)
 
 # --- Main Entry Point ---
 
