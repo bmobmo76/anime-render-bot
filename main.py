@@ -32,14 +32,9 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # --- Your Personal Kuhi API URL ---
 KUHI_API = "https://my-kuhi-api.onrender.com" # <--- ENSURE THIS IS YOUR URL
 
-# --- Setup a robust HTTP session with retries ---
+# --- Setup a robust HTTP session ---
 session = requests.Session()
-retries = Retry(
-    total=3,
-    backoff_factor=2,
-    status_forcelist=[500, 502, 503, 504],
-    allowed_methods=["GET"]
-)
+retries = Retry(total=3, backoff_factor=2, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET"])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 # --- Helper Functions ---
@@ -62,9 +57,7 @@ def search_kuhi(query):
         resp = session.get(f"{KUHI_API}/anime/search", params={"query": query, "page": 1, "per_page": 10}, timeout=60)
         resp.raise_for_status()
         data = resp.json()
-        results = data.get("results", [])
-        logger.info(f"Search returned {len(results)} results")
-        return results
+        return data.get("results", [])
     except Exception as e:
         logger.error(f"Kuhi search error: {e}")
         return []
@@ -83,9 +76,9 @@ def get_episodes(anime_id):
             for audio in ["sub", "dub"]:
                 for ep in ep_data.get(audio, []):
                     if isinstance(ep, dict) and "number" in ep:
-                        episodes_set.add(ep["number"])
-                    elif isinstance(ep, int):
-                        episodes_set.add(ep)
+                        episodes_set.add(int(ep["number"]))
+                    elif isinstance(ep, (int, str)) and str(ep).isdigit():
+                        episodes_set.add(int(ep))
         
         episodes = sorted(list(episodes_set))
         logger.info(f"Fetched {len(episodes)} episodes")
@@ -107,19 +100,15 @@ def extract_stream(anime_id, episode_number, audio_type):
             logger.warning("No streams found in response.")
             return None, None
         
-        # Prioritize HLS streams
         for stream in streams:
             if stream.get("type") == "hls":
                 stream_url = stream.get("url")
-                # Add a browser User-Agent to bypass simple blocks
                 headers = {
                     "Referer": stream.get("referer", "https://megaplay.buzz/"),
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 }
-                logger.info(f"Stream URL found: {stream_url[:80]}...")
                 return stream_url, headers
         
-        # Fallback to the first stream if no HLS
         stream = streams[0]
         stream_url = stream.get("url")
         headers = {
@@ -133,11 +122,12 @@ def extract_stream(anime_id, episode_number, audio_type):
 
 def download_with_ffmpeg(stream_url, output_path, headers=None):
     logger.info("Starting FFmpeg download...")
-    cmd = ["ffmpeg", "-i", stream_url, "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", output_path, "-y"]
+    # REMOVED: -bsf:a aac_adtstoasc (this was causing failures on non-AAC streams)
+    cmd = ["ffmpeg", "-i", stream_url, "-c", "copy", "-movflags", "+faststart", output_path, "-y"]
+    
     if headers:
-        # Properly format headers for FFmpeg with CRLF
         header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
-        cmd = ["ffmpeg", "-headers", header_str, "-i", stream_url, "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", output_path, "-y"]
+        cmd = ["ffmpeg", "-headers", header_str, "-i", stream_url, "-c", "copy", "-movflags", "+faststart", output_path, "-y"]
     
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -166,6 +156,34 @@ def send_video_chunked(chat_id, file_path, caption):
     send_resp = requests.post(f"{TELEGRAM_API}/sendVideo", data={"chat_id": chat_id, "video": file_id, "caption": caption, "supports_streaming": "true"}, timeout=120)
     logger.info("Upload complete.")
     return send_resp.ok
+
+# --- Pagination Helper ---
+def build_episode_keyboard(episodes, page=0, per_page=24):
+    keyboard = []
+    row = []
+    start = page * per_page
+    end = start + per_page
+    page_eps = episodes[start:end]
+    
+    for ep_num in page_eps:
+        row.append(InlineKeyboardButton(f"EP {ep_num}", callback_data=f"ep_{ep_num}"))
+        if len(row) == 4:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+        
+    # Navigation buttons
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page_{page-1}"))
+    if end < len(episodes):
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page+1}"))
+        
+    if nav_row:
+        keyboard.append(nav_row)
+        
+    return InlineKeyboardMarkup(keyboard)
 
 # --- Bot Handlers ---
 
@@ -214,16 +232,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['selected_title'] = title
         context.user_data['episodes'] = episodes
         
-        # Pagination: show first 99 episodes
-        keyboard = []
-        row = []
-        for ep_num in episodes[:99]:
-            row.append(InlineKeyboardButton(f"EP {ep_num}", callback_data=f"ep_{ep_num}"))
-            if len(row) == 5: # 5 buttons per row fits better for 3-digit numbers
-                keyboard.append(row); row = []
-        if row: keyboard.append(row)
+        # Show first page
+        reply_markup = build_episode_keyboard(episodes, page=0)
+        await query.edit_message_text(
+            f"**{title}**\n\nSelect an episode (Page 1):", 
+            reply_markup=reply_markup
+        )
+
+    elif data.startswith("page_"):
+        page = int(data.split("_")[1])
+        episodes = context.user_data.get('episodes', [])
+        title = context.user_data.get('selected_title', 'Anime')
         
-        await query.edit_message_text(f"**{title}**\n\nSelect an episode ({len(episodes)} total):", reply_markup=InlineKeyboardMarkup(keyboard))
+        reply_markup = build_episode_keyboard(episodes, page=page)
+        await query.edit_message_text(
+            f"**{title}**\n\nSelect an episode (Page {page+1}):", 
+            reply_markup=reply_markup
+        )
 
     elif data.startswith("ep_"):
         context.user_data['selected_ep'] = data.split("_")[1]
