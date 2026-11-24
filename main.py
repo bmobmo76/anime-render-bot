@@ -17,8 +17,8 @@ if not BOT_TOKEN:
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# --- Anikoto API Worker ---
-ANIKOTO_API = "https://anikotoapi.fampep.workers.dev"
+# --- Aniwatch API ---
+ANIWATCH_API = "https://aniwatch-api-tau.vercel.app"
 
 # --- Helper Functions ---
 
@@ -28,45 +28,44 @@ def send_message(chat_id, text):
     except Exception as e:
         print(f"send_message error: {e}", file=sys.stderr)
 
-def search_anikoto_api(query):
-    """Search using the Anikoto API worker."""
+def search_aniwatch(query):
+    """Search using the Aniwatch API."""
     try:
-        # The worker supports search via /search
-        resp = requests.get(f"{ANIKOTO_API}/search", params={"q": query}, timeout=15)
+        resp = requests.get(f"{ANIWATCH_API}/api/v2/hianime/search", params={"q": query}, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        # The response structure may be a list or dict with 'results'
-        if isinstance(data, list):
-            return data
-        elif isinstance(data, dict):
-            return data.get("results", data.get("data", []))
-        return []
+        # The API returns an 'animes' list inside 'data'
+        return data.get("data", {}).get("animes", [])
     except Exception as e:
-        print(f"Search error: {e}", file=sys.stderr)
+        print(f"Aniwatch search error: {e}", file=sys.stderr)
         return []
 
-def get_episodes(series_id):
-    """Fetch episode list from the Anikoto API worker."""
+def get_episodes(anime_id):
+    """Fetch episodes from the Aniwatch API."""
     try:
-        resp = requests.get(f"{ANIKOTO_API}/series/{series_id}", timeout=15)
+        resp = requests.get(f"{ANIWATCH_API}/api/v2/hianime/anime/{anime_id}/episodes", timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        if isinstance(data, dict) and "data" in data:
-            data = data["data"]
-        return data.get("episodes", [])
+        return data.get("data", {}).get("episodes", [])
     except Exception as e:
         print(f"Episode fetch error: {e}", file=sys.stderr)
         return []
 
-def extract_stream_url(series_id, episode_num, audio_type):
-    """Extract the HLS stream URL using the Anikoto API worker."""
+def extract_stream_url(episode_id, audio_type):
+    """Extract the HLS stream URL for a specific episode."""
     try:
-        # The worker provides a direct stream endpoint
-        resp = requests.get(f"{ANIKOTO_API}/stream/{series_id}/{episode_num}/{audio_type}", timeout=15)
+        # The API expects the episode ID and a category (sub/dub)
+        params = {"animeEpisodeId": episode_id, "category": audio_type}
+        resp = requests.get(f"{ANIWATCH_API}/api/v2/hianime/episode/sources", params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        stream_url = data.get("url") or data.get("stream_url")
-        headers = data.get("headers", {"Referer": "https://megaplay.buzz/"})
+        sources = data.get("data", {}).get("sources", [])
+        if not sources:
+            return None, None
+        
+        # The first source is usually the highest quality HLS stream
+        stream_url = sources[0].get("url")
+        headers = {"Referer": "https://hianime.to/"}
         return stream_url, headers
     except Exception as e:
         print(f"Stream extraction error: {e}", file=sys.stderr)
@@ -110,7 +109,7 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
     await update.message.reply_text(f"🔍 Searching for **{query}**...")
     
-    results = search_anikoto_api(query)
+    results = search_aniwatch(query)
     if not results:
         await update.message.reply_text("❌ No results found. Try a different name.")
         return
@@ -118,10 +117,9 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['search_results'] = results
     keyboard = []
     for i, anime in enumerate(results):
-        title = anime.get('title', f'Result {i+1}')
-        year = anime.get('year', '')
-        label = f"{title} ({year})" if year else title
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"anime_{i}")])
+        title = anime.get('name', f'Result {i+1}')
+        # The API may provide a release year or other metadata
+        keyboard.append([InlineKeyboardButton(title, callback_data=f"anime_{i}")])
     
     await update.message.reply_text("Select an anime:", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -133,17 +131,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("anime_"):
         index = int(data.split("_")[1])
         anime = context.user_data['search_results'][index]
-        series_id = anime.get('id') or anime.get('series_id')
-        title = anime.get('title', 'Anime')
+        anime_id = anime.get('id')
+        title = anime.get('name', 'Anime')
         
         await query.edit_message_text(f"📺 **{title}**\n\nFetching episode list...")
         
-        episodes = get_episodes(series_id)
+        episodes = get_episodes(anime_id)
         if not episodes:
-            await query.edit_message_text("❌ No episodes found for this anime. The season may not have started airing yet.")
+            await query.edit_message_text("❌ No episodes found for this anime.")
             return
         
-        context.user_data['series_id'] = series_id
+        context.user_data['anime_id'] = anime_id
         context.user_data['selected_title'] = title
         context.user_data['episodes'] = episodes
         
@@ -151,6 +149,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = []
         for ep in episodes[:24]:
             ep_num = ep.get('number', '?')
+            ep_id = ep.get('id') # We need the episode ID for stream extraction
+            # Store the episode ID mapping for later use
+            context.user_data.setdefault('episode_map', {})[str(ep_num)] = ep_id
             row.append(InlineKeyboardButton(f"EP {ep_num}", callback_data=f"ep_{ep_num}"))
             if len(row) == 4:
                 keyboard.append(row); row = []
@@ -165,14 +166,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("audio_"):
         audio_type = data.split("_")[1]
-        series_id = context.user_data['series_id']
         title = context.user_data['selected_title']
         ep_num = context.user_data['selected_ep']
+        episode_id = context.user_data['episode_map'].get(ep_num)
         chat_id = query.message.chat_id
+        
+        if not episode_id:
+            await query.edit_message_text("❌ Episode mapping error. Please try again.")
+            return
         
         await query.edit_message_text("⏳ **Extracting stream...**")
         
-        stream_url, headers = extract_stream_url(series_id, ep_num, audio_type)
+        stream_url, headers = extract_stream_url(episode_id, audio_type)
         if not stream_url:
             await query.edit_message_text("❌ Could not extract stream URL. The source may be down or the episode is not yet released in that audio type.")
             return
