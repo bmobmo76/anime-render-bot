@@ -4,8 +4,18 @@ import math
 import subprocess
 import uuid
 import requests
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+
+# --- Setup Logging ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    stream=sys.stdout,
+    force=True
+)
+logger = logging.getLogger(__name__)
 
 # --- Environment Variables ---
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -17,8 +27,9 @@ if not BOT_TOKEN:
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# --- Aniwatch API ---
-ANIWATCH_API = "https://aniwatch-api-tau.vercel.app"
+# --- Your Personal Kuhi API URL ---
+# REPLACE THE URL BELOW WITH YOUR DEPLOYED KUHI API URL
+KUHI_API = "https://my-kuhi-api.onrender.com"
 
 # --- Helper Functions ---
 
@@ -26,52 +37,63 @@ def send_message(chat_id, text):
     try:
         requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=30)
     except Exception as e:
-        print(f"send_message error: {e}", file=sys.stderr)
+        logger.error(f"send_message error: {e}")
 
-def search_aniwatch(query):
-    """Search using the Aniwatch API."""
+def search_kuhi(query):
+    logger.info(f"Searching Kuhi for: {query}")
     try:
-        resp = requests.get(f"{ANIWATCH_API}/api/v2/hianime/search", params={"q": query}, timeout=15)
+        resp = requests.get(f"{KUHI_API}/anime/search", params={"query": query, "page": 1, "per_page": 10}, timeout=20)
         resp.raise_for_status()
         data = resp.json()
-        # The API returns an 'animes' list inside 'data'
-        return data.get("data", {}).get("animes", [])
+        # Kuhi returns a list of results directly or inside a 'results' key
+        results = data if isinstance(data, list) else data.get("results", [])
+        logger.info(f"Search returned {len(results)} results")
+        return results
     except Exception as e:
-        print(f"Aniwatch search error: {e}", file=sys.stderr)
+        logger.error(f"Kuhi search error: {e}")
         return []
 
 def get_episodes(anime_id):
-    """Fetch episodes from the Aniwatch API."""
+    logger.info(f"Fetching episodes for anime ID: {anime_id}")
     try:
-        resp = requests.get(f"{ANIWATCH_API}/api/v2/hianime/anime/{anime_id}/episodes", timeout=15)
+        resp = requests.get(f"{KUHI_API}/anime/{anime_id}/episodes", timeout=20)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("data", {}).get("episodes", [])
+        episodes = data.get("episodes", [])
+        logger.info(f"Fetched {len(episodes)} episodes")
+        return episodes
     except Exception as e:
-        print(f"Episode fetch error: {e}", file=sys.stderr)
+        logger.error(f"Episode fetch error: {e}")
         return []
 
-def extract_stream_url(episode_id, audio_type):
-    """Extract the HLS stream URL for a specific episode."""
+def extract_stream(anime_id, episode_number, audio_type):
+    logger.info(f"Extracting stream for {anime_id} EP {episode_number} ({audio_type})")
     try:
-        # The API expects the episode ID and a category (sub/dub)
-        params = {"animeEpisodeId": episode_id, "category": audio_type}
-        resp = requests.get(f"{ANIWATCH_API}/api/v2/hianime/episode/sources", params=params, timeout=15)
+        # Kuhi's extract endpoint races all providers and returns the fastest working stream
+        params = {
+            "anime_id": anime_id,
+            "episode": episode_number,
+            "type": audio_type  # 'sub' or 'dub'
+        }
+        resp = requests.get(f"{KUHI_API}/extract", params=params, timeout=45)
         resp.raise_for_status()
         data = resp.json()
-        sources = data.get("data", {}).get("sources", [])
-        if not sources:
-            return None, None
         
-        # The first source is usually the highest quality HLS stream
-        stream_url = sources[0].get("url")
-        headers = {"Referer": "https://hianime.to/"}
-        return stream_url, headers
+        stream_url = data.get("url") or data.get("stream_url")
+        headers = data.get("headers", {"Referer": "https://megaplay.buzz/"})
+        
+        if stream_url:
+            logger.info(f"Stream URL found: {stream_url[:80]}...")
+            return stream_url, headers
+        else:
+            logger.warning("No stream URL in response.")
+            return None, None
     except Exception as e:
-        print(f"Stream extraction error: {e}", file=sys.stderr)
+        logger.error(f"Stream extraction error: {e}")
         return None, None
 
 def download_with_ffmpeg(stream_url, output_path, headers=None):
+    logger.info("Starting FFmpeg download...")
     cmd = ["ffmpeg", "-i", stream_url, "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", output_path, "-y"]
     if headers:
         header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
@@ -79,11 +101,13 @@ def download_with_ffmpeg(stream_url, output_path, headers=None):
     
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"FFmpeg error: {result.stderr}", file=sys.stderr)
+        logger.error(f"FFmpeg error: {result.stderr}")
         return False
+    logger.info("FFmpeg download complete.")
     return True
 
 def send_video_chunked(chat_id, file_path, caption):
+    logger.info("Starting chunked upload to Telegram...")
     chunk_size = 5 * 1024 * 1024
     file_size = os.path.getsize(file_path)
     total_parts = math.ceil(file_size / chunk_size)
@@ -95,9 +119,12 @@ def send_video_chunked(chat_id, file_path, caption):
             if file_id: data["file_id"] = file_id
             files = {"file": (f"part_{part_number}.mp4", chunk, "application/octet-stream")}
             resp = requests.post(f"{TELEGRAM_API}/uploadFile", data=data, files=files, timeout=120)
-            if not resp.ok or not resp.json().get("ok"): return False
+            if not resp.ok or not resp.json().get("ok"):
+                logger.error(f"Upload part {part_number} failed.")
+                return False
             file_id = resp.json()["result"]["file_id"]
     send_resp = requests.post(f"{TELEGRAM_API}/sendVideo", data={"chat_id": chat_id, "video": file_id, "caption": caption, "supports_streaming": "true"}, timeout=120)
+    logger.info("Upload complete.")
     return send_resp.ok
 
 # --- Bot Handlers ---
@@ -109,7 +136,7 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
     await update.message.reply_text(f"🔍 Searching for **{query}**...")
     
-    results = search_aniwatch(query)
+    results = search_kuhi(query)
     if not results:
         await update.message.reply_text("❌ No results found. Try a different name.")
         return
@@ -117,8 +144,7 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['search_results'] = results
     keyboard = []
     for i, anime in enumerate(results):
-        title = anime.get('name', f'Result {i+1}')
-        # The API may provide a release year or other metadata
+        title = anime.get('title') or anime.get('name', f'Result {i+1}')
         keyboard.append([InlineKeyboardButton(title, callback_data=f"anime_{i}")])
     
     await update.message.reply_text("Select an anime:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -131,8 +157,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("anime_"):
         index = int(data.split("_")[1])
         anime = context.user_data['search_results'][index]
-        anime_id = anime.get('id')
-        title = anime.get('name', 'Anime')
+        anime_id = anime.get('id') or anime.get('anime_id')
+        title = anime.get('title') or anime.get('name', 'Anime')
         
         await query.edit_message_text(f"📺 **{title}**\n\nFetching episode list...")
         
@@ -148,10 +174,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = []
         row = []
         for ep in episodes[:24]:
-            ep_num = ep.get('number', '?')
-            ep_id = ep.get('id') # We need the episode ID for stream extraction
-            # Store the episode ID mapping for later use
-            context.user_data.setdefault('episode_map', {})[str(ep_num)] = ep_id
+            ep_num = ep.get('number') or ep.get('episode')
             row.append(InlineKeyboardButton(f"EP {ep_num}", callback_data=f"ep_{ep_num}"))
             if len(row) == 4:
                 keyboard.append(row); row = []
@@ -166,18 +189,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("audio_"):
         audio_type = data.split("_")[1]
+        anime_id = context.user_data['anime_id']
         title = context.user_data['selected_title']
         ep_num = context.user_data['selected_ep']
-        episode_id = context.user_data['episode_map'].get(ep_num)
         chat_id = query.message.chat_id
-        
-        if not episode_id:
-            await query.edit_message_text("❌ Episode mapping error. Please try again.")
-            return
         
         await query.edit_message_text("⏳ **Extracting stream...**")
         
-        stream_url, headers = extract_stream_url(episode_id, audio_type)
+        stream_url, headers = extract_stream(anime_id, ep_num, audio_type)
         if not stream_url:
             await query.edit_message_text("❌ Could not extract stream URL. The source may be down or the episode is not yet released in that audio type.")
             return
