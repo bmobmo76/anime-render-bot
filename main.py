@@ -5,6 +5,7 @@ import subprocess
 import uuid
 import requests
 import logging
+import asyncio
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -37,7 +38,7 @@ session = requests.Session()
 retries = Retry(total=3, backoff_factor=2, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET"])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
-# --- Helper Functions ---
+# --- Helper Functions (Synchronous, to be run in threads) ---
 
 def get_text(item):
     if isinstance(item, str):
@@ -121,7 +122,6 @@ def extract_stream(anime_id, episode_number, audio_type):
         return None, None
 
 def download_with_ffmpeg(stream_url, output_path, headers=None):
-    """Fallback downloader using FFmpeg with Origin header."""
     logger.info("Starting FFmpeg fallback download...")
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
     referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
@@ -147,13 +147,11 @@ def download_with_ffmpeg(stream_url, output_path, headers=None):
     return True
 
 def download_with_ytdlp(stream_url, output_path, headers=None):
-    """Use yt-dlp to download the stream robustly with Origin headers."""
     logger.info("Starting yt-dlp download...")
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
     referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
     origin = referer.rstrip('/')
 
-    # Use --add-header for Origin, and simplified format selection
     cmd = [
         "yt-dlp",
         "--no-warnings",
@@ -171,7 +169,6 @@ def download_with_ytdlp(stream_url, output_path, headers=None):
         logger.error(f"yt-dlp error: {result.stderr}")
         return download_with_ffmpeg(stream_url, output_path, headers)
     
-    # Handle potential extension changes
     if not os.path.exists(output_path):
         dir_name = os.path.dirname(output_path)
         base_name = os.path.basename(output_path).split('.')[0]
@@ -209,12 +206,10 @@ def send_video_chunked(chat_id, file_path, caption):
                     logger.error(f"Upload part {part_number} rejected: {result}")
                     return False
                 file_id = result["result"]["file_id"]
-                logger.info(f"Uploaded part {part_number + 1}/{total_parts}")
             except Exception as e:
                 logger.error(f"Upload part {part_number} failed: {e}")
                 return False
 
-    logger.info("Upload complete. Sending video...")
     try:
         send_resp = requests.post(
             f"{TELEGRAM_API}/sendVideo",
@@ -222,7 +217,6 @@ def send_video_chunked(chat_id, file_path, caption):
             timeout=300
         )
         if send_resp.ok:
-            logger.info("Video sent successfully.")
             return True
         else:
             logger.warning(f"sendVideo failed: {send_resp.text}. Trying sendDocument fallback...")
@@ -235,14 +229,8 @@ def send_video_chunked(chat_id, file_path, caption):
             data={"chat_id": chat_id, "document": file_id, "caption": caption},
             timeout=300
         )
-        if doc_resp.ok:
-            logger.info("Document sent successfully via fallback.")
-            return True
-        else:
-            logger.error(f"sendDocument fallback failed: {doc_resp.text}")
-            return False
+        return doc_resp.ok
     except Exception as e:
-        logger.error(f"sendDocument fallback failed: {e}")
         return False
 
 # --- Pagination Helper ---
@@ -281,7 +269,9 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
     await update.message.reply_text(f"🔍 Searching for **{query}**...")
     
-    results = search_kuhi(query)
+    # Run blocking search in a separate thread
+    results = await asyncio.to_thread(search_kuhi, query)
+    
     if not results:
         await update.message.reply_text("❌ No results found. Try a different name.")
         return
@@ -310,7 +300,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text(f"📺 **{title}**\n\nFetching episode list...")
         
-        episodes = get_episodes(anime_id)
+        # Run blocking episode fetch in a separate thread
+        episodes = await asyncio.to_thread(get_episodes, anime_id)
+        
         if not episodes:
             await query.edit_message_text("❌ No episodes found for this anime.")
             return
@@ -350,7 +342,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.edit_message_text("⏳ **Extracting stream...**")
         
-        stream_url, headers = extract_stream(anime_id, ep_num, audio_type)
+        # Run blocking extraction in a separate thread
+        stream_url, headers = await asyncio.to_thread(extract_stream, anime_id, ep_num, audio_type)
+        
         if not stream_url:
             await query.edit_message_text("❌ Could not extract stream URL. The source may be down or the episode is not yet released in that audio type.")
             return
@@ -358,7 +352,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         output_file = f"/tmp/anime_{uuid.uuid4().hex}.mp4"
         await query.edit_message_text("⏳ **Downloading and merging...**")
         
-        if not download_with_ytdlp(stream_url, output_file, headers):
+        # Run blocking download in a separate thread
+        success = await asyncio.to_thread(download_with_ytdlp, stream_url, output_file, headers)
+        if not success:
             await query.edit_message_text("❌ Download failed. Both yt-dlp and FFmpeg fallback failed.")
             return
         
@@ -366,7 +362,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"📤 **Uploading ({file_size_mb:.1f} MB)...**")
         
         caption = f"**{title}** — EP {ep_num} ({audio_type.upper()})"
-        if send_video_chunked(chat_id, output_file, caption):
+        
+        # Run blocking upload in a separate thread
+        upload_success = await asyncio.to_thread(send_video_chunked, chat_id, output_file, caption)
+        
+        if upload_success:
             await query.edit_message_text("✅ Done.")
         else:
             await query.edit_message_text("❌ Upload failed. Check logs for details.")
