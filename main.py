@@ -3,7 +3,6 @@ import sys
 import math
 import subprocess
 import uuid
-import re
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -11,15 +10,17 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # --- Environment Variables ---
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
+NOTTE_API_KEY = os.environ.get("NOTTE_API_KEY")
 PORT = int(os.environ.get("PORT", 8080))
 
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN is not set.")
+if not NOTTE_API_KEY:
+    raise ValueError("NOTTE_API_KEY is not set.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-ANILIST_URL = "https://graphql.anilist.co"
-ANIKOTO_BASE = "https://anikotoapi.site"
-ANIKOTO_SITE = "https://anikototv.to"
+NOTTE_FUNCTION_ID = "e9c65d3b-9d17-4636-93f1-3fbf0d575704"
+NOTTE_URL = f"https://us-prod.notte.cc/functions/{NOTTE_FUNCTION_ID}/runs/start"
 
 # --- Helper Functions ---
 
@@ -29,127 +30,62 @@ def send_message(chat_id, text):
     except Exception as e:
         print(f"send_message error: {e}", file=sys.stderr)
 
-def search_anilist(query):
-    gql = """
-    query ($search: String) {
-      Page(page: 1, perPage: 10) {
-        media(search: $search, type: ANIME, sort: POPULARITY_DESC) {
-          id
-          title { romaji english }
-          episodes
-          status
-          seasonYear
+def search_notte(query):
+    """Search Anikoto using the Notte Anything API."""
+    payload = {
+        "function_id": NOTTE_FUNCTION_ID,
+        "variables": {
+            "site": "anikoto",
+            "query": query,
+            "media_type": "all",
+            "page": 1,
+            "limit": 10,
+            "sort": "popular",
+            "include_streams": False
         }
-      }
     }
-    """
-    variables = {"search": query}
+    headers = {
+        "x-notte-api-key": NOTTE_API_KEY,
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {NOTTE_API_KEY}"
+    }
     try:
-        resp = requests.post(ANILIST_URL, json={"query": gql, "variables": variables}, timeout=15)
+        resp = requests.post(NOTTE_URL, json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("data", {}).get("Page", {}).get("media", [])
+        return data.get("items", [])
     except Exception as e:
-        print(f"AniList search error: {e}", file=sys.stderr)
+        print(f"Notte search error: {e}", file=sys.stderr)
         return []
 
-def find_anikoto_series(title, year=None):
-    """
-    Correctly search Anikoto using its internal AJAX endpoint.
-    Flow: /ajax/anime/search?keyword=... -> parse /watch/<slug> -> get data-id.
-    """
-    try:
-        # 1. Use the AJAX search endpoint
-        search_url = f"{ANIKOTO_SITE}/ajax/anime/search"
-        params = {"keyword": title}
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "text/html, */*; q=0.01",
-            "Referer": f"{ANIKOTO_SITE}/home"
+def get_notte_episodes(item_id):
+    """Fetch the episode list for a specific Anikoto series via Notte."""
+    payload = {
+        "function_id": NOTTE_FUNCTION_ID,
+        "variables": {
+            "site": "anikoto",
+            "item_id": item_id,
+            "episode_limit": 100,
+            "include_streams": False
         }
-        resp = requests.get(search_url, params=params, headers=headers, timeout=15)
-        resp.raise_for_status()
-        
-        # 2. Parse the response for /watch/ links
-        # The response is HTML containing <a href="/watch/slug">...</a>
-        watch_matches = re.findall(r'href="(/watch/[^"]+)"', resp.text)
-        if not watch_matches:
-            print("No /watch/ links found in search response.", file=sys.stderr)
-            return None
-            
-        # 3. Take the first result and fetch its watch page
-        slug_url = f"{ANIKOTO_SITE}{watch_matches[0]}"
-        print(f"Fetching watch page: {slug_url}", file=sys.stderr)
-        
-        page = requests.get(slug_url, headers=headers, timeout=15)
-        page.raise_for_status()
-        
-        # 4. Extract the numeric data-id from #watch-main
-        # Example: <div id="watch-main" data-id="12345" ...>
-        id_match = re.search(r'id="watch-main"[^>]*data-id="(\d+)"', page.text)
-        if id_match:
-            return id_match.group(1)
-            
-        # Fallback: look for any /series/123 link on the page
-        series_match = re.search(r'/series/(\d+)', page.text)
-        if series_match:
-            return series_match.group(1)
-            
-        # Fallback: look for data-url which might contain the slug, but the API needs a numeric ID.
-        # If we can't find a numeric ID, we fail gracefully.
-        print("Could not extract numeric data-id from watch page.", file=sys.stderr)
-        return None
-        
-    except Exception as e:
-        print(f"Anikoto scrape error: {e}", file=sys.stderr)
-        return None
-
-def get_episodes(series_id):
+    }
+    headers = {
+        "x-notte-api-key": NOTTE_API_KEY,
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {NOTTE_API_KEY}"
+    }
     try:
-        resp = requests.get(f"{ANIKOTO_BASE}/series/{series_id}", timeout=15)
+        resp = requests.post(NOTTE_URL, json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        if isinstance(data, dict) and "data" in data:
-            data = data["data"]
-        episodes = data.get("episodes", [])
-        return episodes
-    except Exception as e:
-        print(f"Episode fetch error: {e}", file=sys.stderr)
+        # The API returns a single item with an episodes array
+        items = data.get("items", [])
+        if items:
+            return items[0].get("episodes", [])
         return []
-
-def extract_stream_url(series_id, episode_num, audio_type):
-    episodes = get_episodes(series_id)
-    if not episodes:
-        return None, None
-        
-    target_ep = next((ep for ep in episodes if str(ep.get("number", "")) == str(episode_num)), None)
-    if not target_ep:
-        return None, None
-        
-    embed_id = target_ep.get("embed_id") or target_ep.get("id")
-    if not embed_id:
-        return None, None
-        
-    embed_url = f"https://megaplay.buzz/stream/s-2/{embed_id}/{audio_type}"
-    
-    try:
-        page = requests.get(embed_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        page.raise_for_status()
-        html = page.text
-        
-        m3u8_matches = re.findall(r'https?://[^\s"\']+\.m3u8[^\s"\']*', html)
-        if m3u8_matches:
-            return m3u8_matches[0], {"Referer": "https://megaplay.buzz/"}
-            
-        file_matches = re.findall(r'file\s*:\s*["\']([^"\']+)["\']', html)
-        if file_matches:
-            return file_matches[0], {"Referer": "https://megaplay.buzz/"}
-            
-        return None, None
     except Exception as e:
-        print(f"Stream extraction error: {e}", file=sys.stderr)
-        return None, None
+        print(f"Notte episode fetch error: {e}", file=sys.stderr)
+        return []
 
 def download_with_ffmpeg(stream_url, output_path, headers=None):
     cmd = ["ffmpeg", "-i", stream_url, "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", output_path, "-y"]
@@ -189,48 +125,43 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
     await update.message.reply_text(f"🔍 Searching for **{query}**...")
     
-    results = search_anilist(query)
+    results = search_notte(query)
     if not results:
-        await update.message.reply_text("❌ No results found on AniList. Try a different name.")
+        await update.message.reply_text("❌ No results found. Try a different name.")
         return
     
-    context.user_data['anilist_results'] = results
+    context.user_data['search_results'] = results
     keyboard = []
-    for i, media in enumerate(results):
-        title = media.get("title", {}).get("english") or media.get("title", {}).get("romaji") or f"Result {i+1}"
-        year = media.get("seasonYear", "")
+    for i, item in enumerate(results):
+        title = item.get('title', f'Result {i+1}')
+        year = item.get('year', '')
         label = f"{title} ({year})" if year else title
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"anilist_{i}")])
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"anime_{i}")])
     
-    await update.message.reply_text("Select an anime from AniList:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Select an anime:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    if data.startswith("anilist_"):
+    if data.startswith("anime_"):
         index = int(data.split("_")[1])
-        media = context.user_data['anilist_results'][index]
-        title = media.get("title", {}).get("english") or media.get("title", {}).get("romaji")
-        year = media.get("seasonYear")
+        item = context.user_data['search_results'][index]
+        item_id = item.get('id') or item.get('detail_id')
+        title = item.get('title', 'Anime')
         
-        await query.edit_message_text(f"📺 **{title}**\n\nMapping to Anikoto source...")
+        await query.edit_message_text(f"📺 **{title}**\n\nFetching episode list...")
         
-        series_id = find_anikoto_series(title, year)
-        if not series_id:
-            await query.edit_message_text(f"❌ Could not find a matching source for **{title}** on Anikoto. The site may be down or the anime is not hosted there.")
-            return
-        
-        context.user_data['series_id'] = series_id
-        context.user_data['selected_title'] = title
-        
-        episodes = get_episodes(series_id)
+        episodes = get_notte_episodes(item_id)
         if not episodes:
-            await query.edit_message_text(f"❌ Found source, but it has no episode list yet. The season may not have started airing.")
+            await query.edit_message_text("❌ No episodes found for this anime.")
             return
         
+        context.user_data['item_id'] = item_id
+        context.user_data['selected_title'] = title
         context.user_data['episodes'] = episodes
+        
         keyboard = []
         row = []
         for ep in episodes[:24]:
@@ -249,35 +180,75 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("audio_"):
         audio_type = data.split("_")[1]
-        series_id = context.user_data['series_id']
+        item_id = context.user_data['item_id']
         title = context.user_data['selected_title']
         ep_num = context.user_data['selected_ep']
         chat_id = query.message.chat_id
         
         await query.edit_message_text("⏳ **Extracting stream...**")
         
-        stream_url, headers = extract_stream_url(series_id, ep_num, audio_type)
-        if not stream_url:
-            await query.edit_message_text("❌ Could not extract stream URL. The source may be down or the episode is not yet released in that audio type.")
-            return
-        
-        output_file = f"/tmp/anime_{uuid.uuid4().hex}.mp4"
-        await query.edit_message_text("⏳ **Downloading and merging...**")
-        
-        if not download_with_ffmpeg(stream_url, output_file, headers):
-            await query.edit_message_text("❌ Download failed. FFmpeg error.")
-            return
-        
-        file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
-        await query.edit_message_text(f"📤 **Uploading ({file_size_mb:.1f} MB)...**")
-        
-        caption = f"**{title}** — EP {ep_num} ({audio_type.upper()})"
-        if send_video_chunked(chat_id, output_file, caption):
-            await query.edit_message_text("✅ Done.")
-        else:
-            await query.edit_message_text("❌ Upload failed.")
-        
-        if os.path.exists(output_file): os.remove(output_file)
+        # We need to get the stream URL for the specific episode.
+        # We can use the Notte API again with include_streams=True.
+        payload = {
+            "function_id": NOTTE_FUNCTION_ID,
+            "variables": {
+                "site": "anikoto",
+                "item_id": item_id,
+                "episode": int(ep_num),
+                "audio": audio_type,
+                "include_streams": True,
+                "max_servers": 1
+            }
+        }
+        headers = {
+            "x-notte-api-key": NOTTE_API_KEY,
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {NOTTE_API_KEY}"
+        }
+        try:
+            resp = requests.post(NOTTE_URL, json=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("items", [])
+            if not items:
+                await query.edit_message_text("❌ Could not extract stream URL.")
+                return
+            
+            # The stream URL is in the streaming_links array
+            streams = items[0].get("streaming_links", [])
+            if not streams:
+                await query.edit_message_text("❌ No stream links found.")
+                return
+            
+            stream_url = streams[0].get("url")
+            if not stream_url:
+                await query.edit_message_text("❌ Stream URL is empty.")
+                return
+            
+            # Notte may also return headers required for the stream
+            stream_headers = streams[0].get("headers", {"Referer": "https://megaplay.buzz/"})
+            
+            output_file = f"/tmp/anime_{uuid.uuid4().hex}.mp4"
+            await query.edit_message_text("⏳ **Downloading and merging...**")
+            
+            if not download_with_ffmpeg(stream_url, output_file, stream_headers):
+                await query.edit_message_text("❌ Download failed. FFmpeg error.")
+                return
+            
+            file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
+            await query.edit_message_text(f"📤 **Uploading ({file_size_mb:.1f} MB)...**")
+            
+            caption = f"**{title}** — EP {ep_num} ({audio_type.upper()})"
+            if send_video_chunked(chat_id, output_file, caption):
+                await query.edit_message_text("✅ Done.")
+            else:
+                await query.edit_message_text("❌ Upload failed.")
+            
+            if os.path.exists(output_file): os.remove(output_file)
+            
+        except Exception as e:
+            print(f"Download error: {e}", file=sys.stderr)
+            await query.edit_message_text(f"❌ Error: {str(e)[:100]}")
 
 # --- Main Entry Point ---
 
