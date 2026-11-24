@@ -5,6 +5,8 @@ import subprocess
 import uuid
 import requests
 import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
@@ -28,19 +30,21 @@ if not BOT_TOKEN:
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # --- Your Personal Kuhi API URL ---
-# REPLACE THE URL BELOW WITH YOUR DEPLOYED KUHI API URL
-KUHI_API = "https://my-kuhi-api.onrender.com" # <--- MAKE SURE THIS IS YOUR URL
+KUHI_API = "https://my-kuhi-api.onrender.com" # <--- ENSURE THIS IS YOUR URL
+
+# --- Setup a robust HTTP session with retries ---
+session = requests.Session()
+retries = Retry(
+    total=3,
+    backoff_factor=2, # Wait 2s, then 4s, then 8s between retries
+    status_forcelist=[500, 502, 503, 504],
+    allowed_methods=["GET"]
+)
+session.mount('https://', HTTPAdapter(max_retries=retries))
 
 # --- Helper Functions ---
 
-def send_message(chat_id, text):
-    try:
-        requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=30)
-    except Exception as e:
-        logger.error(f"send_message error: {e}")
-
 def get_text(item):
-    """Safely extract a string from a dict or string title."""
     if isinstance(item, str):
         return item
     if isinstance(item, dict):
@@ -55,7 +59,8 @@ def get_text(item):
 def search_kuhi(query):
     logger.info(f"Searching Kuhi for: {query}")
     try:
-        resp = requests.get(f"{KUHI_API}/anime/search", params={"query": query, "page": 1, "per_page": 10}, timeout=20)
+        # Using session with retries
+        resp = session.get(f"{KUHI_API}/anime/search", params={"query": query, "page": 1, "per_page": 10}, timeout=60)
         resp.raise_for_status()
         data = resp.json()
         results = data.get("results", [])
@@ -66,15 +71,13 @@ def search_kuhi(query):
         return []
 
 def get_episodes(anime_id):
-    """Fetch episode list using the correct Kuhi endpoint: /anime/episodes/{id}."""
     logger.info(f"Fetching episodes for anime ID: {anime_id}")
     try:
-        resp = requests.get(f"{KUHI_API}/anime/episodes/{anime_id}", timeout=30)
+        # Using session with retries. Timeout is increased to 90s to handle cold starts.
+        resp = session.get(f"{KUHI_API}/anime/episodes/{anime_id}", timeout=90)
         resp.raise_for_status()
         data = resp.json()
         
-        # The Kuhi API returns episodes grouped by provider and audio type.
-        # We need to flatten this into a simple list of episode numbers.
         episodes_set = set()
         providers = data.get("providers", {})
         for provider_data in providers.values():
@@ -94,11 +97,10 @@ def get_episodes(anime_id):
         return []
 
 def extract_stream(anime_id, episode_number, audio_type):
-    """Extract stream using the correct Kuhi endpoint: /anime/extract/{id}?e={ep}&type={sub|dub}."""
     logger.info(f"Extracting stream for {anime_id} EP {episode_number} ({audio_type})")
     try:
         params = {"e": episode_number, "type": audio_type}
-        resp = requests.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=60)
+        resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=90)
         resp.raise_for_status()
         data = resp.json()
         
@@ -107,7 +109,6 @@ def extract_stream(anime_id, episode_number, audio_type):
             logger.warning("No streams found in response.")
             return None, None
         
-        # Pick the first HLS stream
         for stream in streams:
             if stream.get("type") == "hls":
                 stream_url = stream.get("url")
@@ -115,7 +116,6 @@ def extract_stream(anime_id, episode_number, audio_type):
                 logger.info(f"Stream URL found: {stream_url[:80]}...")
                 return stream_url, headers
         
-        # Fallback to first stream of any type
         stream = streams[0]
         stream_url = stream.get("url")
         headers = {"Referer": stream.get("referer", "https://megaplay.buzz/")}
