@@ -36,7 +36,7 @@ KUHI_API = "https://my-kuhi-api.onrender.com" # <--- ENSURE THIS IS YOUR URL
 session = requests.Session()
 retries = Retry(
     total=3,
-    backoff_factor=2, # Wait 2s, then 4s, then 8s between retries
+    backoff_factor=2,
     status_forcelist=[500, 502, 503, 504],
     allowed_methods=["GET"]
 )
@@ -59,7 +59,6 @@ def get_text(item):
 def search_kuhi(query):
     logger.info(f"Searching Kuhi for: {query}")
     try:
-        # Using session with retries
         resp = session.get(f"{KUHI_API}/anime/search", params={"query": query, "page": 1, "per_page": 10}, timeout=60)
         resp.raise_for_status()
         data = resp.json()
@@ -73,7 +72,6 @@ def search_kuhi(query):
 def get_episodes(anime_id):
     logger.info(f"Fetching episodes for anime ID: {anime_id}")
     try:
-        # Using session with retries. Timeout is increased to 90s to handle cold starts.
         resp = session.get(f"{KUHI_API}/anime/episodes/{anime_id}", timeout=90)
         resp.raise_for_status()
         data = resp.json()
@@ -109,16 +107,25 @@ def extract_stream(anime_id, episode_number, audio_type):
             logger.warning("No streams found in response.")
             return None, None
         
+        # Prioritize HLS streams
         for stream in streams:
             if stream.get("type") == "hls":
                 stream_url = stream.get("url")
-                headers = {"Referer": stream.get("referer", "https://megaplay.buzz/")}
+                # Add a browser User-Agent to bypass simple blocks
+                headers = {
+                    "Referer": stream.get("referer", "https://megaplay.buzz/"),
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                }
                 logger.info(f"Stream URL found: {stream_url[:80]}...")
                 return stream_url, headers
         
+        # Fallback to the first stream if no HLS
         stream = streams[0]
         stream_url = stream.get("url")
-        headers = {"Referer": stream.get("referer", "https://megaplay.buzz/")}
+        headers = {
+            "Referer": stream.get("referer", "https://megaplay.buzz/"),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
         return stream_url, headers
     except Exception as e:
         logger.error(f"Stream extraction error: {e}")
@@ -128,6 +135,7 @@ def download_with_ffmpeg(stream_url, output_path, headers=None):
     logger.info("Starting FFmpeg download...")
     cmd = ["ffmpeg", "-i", stream_url, "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", output_path, "-y"]
     if headers:
+        # Properly format headers for FFmpeg with CRLF
         header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
         cmd = ["ffmpeg", "-headers", header_str, "-i", stream_url, "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", output_path, "-y"]
     
@@ -206,11 +214,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['selected_title'] = title
         context.user_data['episodes'] = episodes
         
+        # Pagination: show first 99 episodes
         keyboard = []
         row = []
-        for ep_num in episodes[:24]:
+        for ep_num in episodes[:99]:
             row.append(InlineKeyboardButton(f"EP {ep_num}", callback_data=f"ep_{ep_num}"))
-            if len(row) == 4:
+            if len(row) == 5: # 5 buttons per row fits better for 3-digit numbers
                 keyboard.append(row); row = []
         if row: keyboard.append(row)
         
