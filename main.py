@@ -5,6 +5,7 @@ import subprocess
 import uuid
 import requests
 import logging
+import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -121,18 +122,21 @@ def extract_stream(anime_id, episode_number, audio_type):
         return None, None
 
 def download_with_ytdlp(stream_url, output_path, headers=None):
-    """Use yt-dlp to download the stream robustly."""
+    """Use yt-dlp to download the stream robustly, forcing MP4 format."""
     logger.info("Starting yt-dlp download...")
     
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
     referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
 
+    # Force MP4 output to ensure Telegram compatibility
     cmd = [
         "yt-dlp",
         "--no-warnings",
         "--no-check-certificate",
         "--referer", referer,
         "--user-agent", user_agent,
+        "--merge-output-format", "mp4",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "-o", output_path,
         stream_url
     ]
@@ -144,7 +148,6 @@ def download_with_ytdlp(stream_url, output_path, headers=None):
     
     # yt-dlp might add an extension, so we find the actual downloaded file
     if not os.path.exists(output_path):
-        # Check if it saved with a different extension (e.g., .webm, .mkv)
         dir_name = os.path.dirname(output_path)
         base_name = os.path.basename(output_path).split('.')[0]
         for f in os.listdir(dir_name):
@@ -156,25 +159,85 @@ def download_with_ytdlp(stream_url, output_path, headers=None):
     return True
 
 def send_video_chunked(chat_id, file_path, caption):
+    """
+    Upload a video using Telegram's chunked upload, then send it.
+    Uses a long timeout to account for Telegram's video processing time.
+    Falls back to sendDocument if sendVideo fails.
+    """
     logger.info("Starting chunked upload to Telegram...")
     chunk_size = 5 * 1024 * 1024
     file_size = os.path.getsize(file_path)
     total_parts = math.ceil(file_size / chunk_size)
     file_id = None
-    with open(file_path, "rb") as f:
-        for part_number in range(total_parts):
+    
+    for part_number in range(total_parts):
+        with open(file_path, "rb") as f:
+            f.seek(part_number * chunk_size)
             chunk = f.read(chunk_size)
+            if not chunk:
+                continue
+                
             data = {"part_number": str(part_number), "total_parts": str(total_parts)}
-            if file_id: data["file_id"] = file_id
+            if file_id: 
+                data["file_id"] = file_id
+                
             files = {"file": (f"part_{part_number}.mp4", chunk, "application/octet-stream")}
-            resp = requests.post(f"{TELEGRAM_API}/uploadFile", data=data, files=files, timeout=120)
-            if not resp.ok or not resp.json().get("ok"):
-                logger.error(f"Upload part {part_number} failed.")
+            
+            try:
+                resp = requests.post(f"{TELEGRAM_API}/uploadFile", data=data, files=files, timeout=300) # 5-minute timeout
+                resp.raise_for_status()
+                result = resp.json()
+                if not result.get("ok"):
+                    logger.error(f"Upload part {part_number} rejected: {result}")
+                    return False
+                file_id = result["result"]["file_id"]
+                logger.info(f"Uploaded part {part_number + 1}/{total_parts}")
+            except Exception as e:
+                logger.error(f"Upload part {part_number} failed: {e}")
                 return False
-            file_id = resp.json()["result"]["file_id"]
-    send_resp = requests.post(f"{TELEGRAM_API}/sendVideo", data={"chat_id": chat_id, "video": file_id, "caption": caption, "supports_streaming": "true"}, timeout=120)
-    logger.info("Upload complete.")
-    return send_resp.ok
+
+    # Now send the video using the file_id
+    logger.info("Upload complete. Sending video...")
+    try:
+        send_resp = requests.post(
+            f"{TELEGRAM_API}/sendVideo",
+            data={
+                "chat_id": chat_id,
+                "video": file_id,
+                "caption": caption,
+                "supports_streaming": "true"
+            },
+            timeout=300 # 5-minute timeout for transcoding
+        )
+        
+        if send_resp.ok:
+            logger.info("Video sent successfully.")
+            return True
+        else:
+            logger.warning(f"sendVideo failed: {send_resp.text}. Trying sendDocument fallback...")
+    except Exception as e:
+        logger.error(f"sendVideo request failed: {e}. Trying sendDocument fallback...")
+
+    # Fallback: send as document if video sending fails
+    try:
+        doc_resp = requests.post(
+            f"{TELEGRAM_API}/sendDocument",
+            data={
+                "chat_id": chat_id,
+                "document": file_id,
+                "caption": caption
+            },
+            timeout=300
+        )
+        if doc_resp.ok:
+            logger.info("Document sent successfully via fallback.")
+            return True
+        else:
+            logger.error(f"sendDocument fallback failed: {doc_resp.text}")
+            return False
+    except Exception as e:
+        logger.error(f"sendDocument fallback failed: {e}")
+        return False
 
 # --- Pagination Helper ---
 def build_episode_keyboard(episodes, page=0, per_page=24):
@@ -300,7 +363,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if send_video_chunked(chat_id, output_file, caption):
             await query.edit_message_text("✅ Done.")
         else:
-            await query.edit_message_text("❌ Upload failed.")
+            await query.edit_message_text("❌ Upload failed. Check logs for details.")
         
         if os.path.exists(output_file): os.remove(output_file)
 
