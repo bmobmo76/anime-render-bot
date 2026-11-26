@@ -2,3 +2,6 @@ python-telegram-bot[webhooks]==20.7
 requests
 yt-dlp
 huggingface_hub
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
