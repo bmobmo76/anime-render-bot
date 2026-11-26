@@ -6,11 +6,16 @@ import uuid
 import requests
 import logging
 import asyncio
+import json
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from huggingface_hub import HfApi
+
+# Google API imports
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 # --- Setup Logging ---
 logging.basicConfig(
@@ -26,25 +31,43 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", 8080))
 
-# --- Hugging Face Config ---
-HF_TOKEN = os.environ.get("HF_TOKEN")
-HF_REPO_ID = os.environ.get("HF_REPO_ID")
+# GitHub Config
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO = os.environ.get("GITHUB_REPO") # e.g., "bmobmo76/anime-storage"
 
-if not BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN is not set.")
-if not HF_TOKEN or not HF_REPO_ID:
-    raise ValueError("HF_TOKEN and HF_REPO_ID must be set.")
+# Google Drive Config
+GDRIVE_CLIENT_EMAIL = os.environ.get("GDRIVE_CLIENT_EMAIL")
+GDRIVE_PRIVATE_KEY = os.environ.get("GDRIVE_PRIVATE_KEY")
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-KUHI_API = "https://my-kuhi-api.onrender.com"  # <--- ENSURE THIS IS YOUR URL
+KUHI_API = "https://my-kuhi-api.onrender.com" # <--- ENSURE THIS IS YOUR URL
 
 # --- Setup a robust HTTP session ---
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=2, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET"])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
-# --- Hugging Face API ---
-hf_api = HfApi(token=HF_TOKEN)
+# --- Google Drive Initialization ---
+def get_drive_service():
+    if not GDRIVE_CLIENT_EMAIL or not GDRIVE_PRIVATE_KEY or not GDRIVE_FOLDER_ID:
+        return None
+    try:
+        # Handle newlines in private key
+        private_key = GDRIVE_PRIVATE_KEY.replace("\\n", "\n")
+        creds_info = {
+            "type": "service_account",
+            "client_email": GDRIVE_CLIENT_EMAIL,
+            "private_key": private_key,
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+        creds = service_account.Credentials.from_service_account_info(creds_info)
+        return build('drive', 'v3', credentials=creds)
+    except Exception as e:
+        logger.error(f"Google Drive init error: {e}")
+        return None
+
+drive_service = get_drive_service()
 
 # --- Helper Functions ---
 
@@ -163,21 +186,66 @@ def download_with_ytdlp(stream_url, output_path, headers=None):
     logger.info("yt-dlp download complete.")
     return True
 
-def upload_to_hf(file_path, filename):
-    logger.info(f"Uploading {filename} to Hugging Face...")
+# --- Destination Handlers ---
+
+def upload_telegram_document(chat_id, file_path, caption):
+    logger.info("Uploading to Telegram (as Document)...")
     try:
-        hf_api.upload_file(
-            path_or_fileobj=file_path,
-            path_in_repo=filename,
-            repo_id=HF_REPO_ID,
-            repo_type="dataset"
-        )
-        direct_url = f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{filename}"
-        logger.info(f"Upload successful. URL: {direct_url}")
-        return direct_url
+        with open(file_path, "rb") as f:
+            files = {"document": (os.path.basename(file_path), f, "application/octet-stream")}
+            data = {"chat_id": chat_id, "caption": caption}
+            resp = requests.post(f"{TELEGRAM_API}/sendDocument", data=data, files=files, timeout=300)
+        return resp.ok
     except Exception as e:
-        logger.error(f"Hugging Face upload failed: {e}")
-        return None
+        logger.error(f"Telegram upload error: {e}")
+        return False
+
+def upload_github_release(file_path, filename):
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return "Missing GitHub Config."
+    logger.info("Uploading to GitHub Release...")
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    tag = f"ep-{uuid.uuid4().hex[:6]}"
+    
+    # Create Release
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
+    data = {"tag_name": tag, "name": filename, "draft": False, "prerelease": False}
+    resp = requests.post(url, headers=headers, json=data, timeout=30)
+    if not resp.ok:
+        return f"GitHub Release Error: {resp.text}"
+    
+    release_data = resp.json()
+    upload_url_template = release_data["upload_url"]
+    upload_url = upload_url_template.replace("{?name,label}", f"?name={filename}")
+    
+    # Upload Asset
+    with open(file_path, "rb") as f:
+        headers["Content-Type"] = "application/octet-stream"
+        resp = requests.post(upload_url, headers=headers, data=f, timeout=600)
+        
+    if resp.ok:
+        return release_data["html_url"]
+    return f"GitHub Upload Error: {resp.text}"
+
+def upload_gdrive(file_path, filename):
+    if not drive_service:
+        return "Missing Google Drive Config."
+    logger.info("Uploading to Google Drive...")
+    try:
+        file_metadata = {'name': filename, 'parents': [GDRIVE_FOLDER_ID]}
+        media = MediaFileUpload(file_path, resumable=True)
+        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+        
+        file_id = file.get('id')
+        # Make it publicly readable
+        drive_service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}).execute()
+        
+        # Direct download link
+        direct_link = f"https://drive.google.com/uc?export=download&id={file_id}"
+        return direct_link
+    except Exception as e:
+        logger.error(f"GDrive Error: {e}")
+        return f"GDrive Error: {str(e)}"
 
 # --- Pagination Helper ---
 def build_episode_keyboard(episodes, page=0, per_page=24):
@@ -279,9 +347,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("audio_"):
         audio_type = data.split("_")[1]
+        context.user_data['audio_type'] = audio_type
+        
+        # Show destination options
+        keyboard = [
+            [InlineKeyboardButton("📥 Send in Telegram", callback_data="dest_telegram")],
+            [InlineKeyboardButton("🐙 GitHub Release Link", callback_data="dest_github")],
+            [InlineKeyboardButton("☁️ Google Drive Link", callback_data="dest_gdrive")]
+        ]
+        await query.edit_message_text("Where do you want to upload the video?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("dest_"):
+        destination = data.split("_")[1]
         anime_id = context.user_data['anime_id']
         title = context.user_data['selected_title']
         ep_num = context.user_data['selected_ep']
+        audio_type = context.user_data['audio_type']
+        chat_id = query.message.chat_id
         
         await query.edit_message_text("⏳ **Extracting stream...**")
         stream_url, headers = await asyncio.to_thread(extract_stream, anime_id, ep_num, audio_type)
@@ -302,21 +384,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
-        await query.edit_message_text(f"📤 **Uploading to Hugging Face ({file_size_mb:.1f} MB)...**")
+        caption = f"**{title}** — EP {ep_num} ({audio_type.upper()})"
         
-        direct_url = await asyncio.to_thread(upload_to_hf, output_file, filename)
+        await query.edit_message_text(f"📤 **Uploading to {destination.upper()} ({file_size_mb:.1f} MB)...**")
         
-        if direct_url:
-            await query.edit_message_text(
-                f"✅ **Upload complete!**\n\n"
-                f"**{title}** — EP {ep_num} ({audio_type.upper()})\n"
-                f"File size: {file_size_mb:.1f} MB\n\n"
-                f"📥 [Click here to download directly]({direct_url})\n\n"
-                f"*Note: This file exceeds Telegram's 50 MB bot limit. Use the direct link to download it in full quality.*",
-                disable_web_page_preview=True
-            )
-        else:
-            await query.edit_message_text("❌ Failed to upload to Hugging Face. Check your token and repo ID.")
+        if destination == "telegram":
+            success = await asyncio.to_thread(upload_telegram_document, chat_id, output_file, caption)
+            if success:
+                await query.edit_message_text("✅ Uploaded to Telegram as a Document.")
+            else:
+                await query.edit_message_text("❌ Telegram upload failed.")
+                
+        elif destination == "github":
+            link_or_err = await asyncio.to_thread(upload_github_release, output_file, filename)
+            if link_or_err.startswith("http"):
+                await query.edit_message_text(
+                    f"✅ **Uploaded to GitHub!**\n\n"
+                    f"{caption}\nFile size: {file_size_mb:.1f} MB\n\n"
+                    f"🐙 [Click here to download from GitHub]({link_or_err})\n\n"
+                    f"*Scroll down on the page and click `{filename}` to start downloading.*",
+                    disable_web_page_preview=True
+                )
+            else:
+                await query.edit_message_text(f"❌ {link_or_err}")
+                
+        elif destination == "gdrive":
+            link_or_err = await asyncio.to_thread(upload_gdrive, output_file, filename)
+            if link_or_err.startswith("http"):
+                await query.edit_message_text(
+                    f"✅ **Uploaded to Google Drive!**\n\n"
+                    f"{caption}\nFile size: {file_size_mb:.1f} MB\n\n"
+                    f"☁️ [Click here to download from Google Drive]({link_or_err})\n\n"
+                    f"*Note: If Google shows a virus warning because it's a large file, click `Download anyway`.*",
+                    disable_web_page_preview=True
+                )
+            else:
+                await query.edit_message_text(f"❌ {link_or_err}")
         
         if os.path.exists(output_file): os.remove(output_file)
 
