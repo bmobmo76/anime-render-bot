@@ -13,7 +13,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from huggingface_hub import HfApi
 
 # Google API imports
-import google.auth
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -51,7 +50,6 @@ hf_api = HfApi(token=HF_TOKEN)
 
 def get_drive_service_oauth():
     if not all([GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN]):
-        logger.warning("Google Drive OAuth credentials not fully set. GDrive will be disabled.")
         return None
     try:
         creds = Credentials(
@@ -103,15 +101,38 @@ def get_episodes(anime_id):
     except Exception as e:
         logger.error(f"Episode error: {e}"); return []
 
-def extract_stream(anime_id, ep, audio):
+def extract_stream_and_subs(anime_id, ep, audio):
+    """Returns (stream_url, headers, subtitle_url)"""
     try:
         resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params={"e": ep, "type": audio}, timeout=90)
         resp.raise_for_status()
-        for s in resp.json().get("streams", []):
-            if s.get("type") == "hls":
-                return s["url"], {"Referer": s.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
+        data = resp.json()
+        
+        streams = data.get("streams", [])
+        subtitles = data.get("subtitles", []) or data.get("tracks", [])
+        
+        # Find English subtitle
+        sub_url = None
+        for track in subtitles:
+            lang = track.get("lang", track.get("language", "")).lower()
+            label = track.get("label", "").lower()
+            if "en" in lang or "english" in label:
+                sub_url = track.get("url", track.get("file"))
+                break
+                
+        # Find HLS stream
+        if streams:
+            for s in streams:
+                if s.get("type") == "hls":
+                    return s.get("url"), {"Referer": s.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}, sub_url
+            # Fallback to first stream if no HLS
+            s = streams[0]
+            return s.get("url"), {"Referer": s.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}, sub_url
+            
     except Exception as e:
-        logger.error(f"Extract error: {e}"); return None, None
+        logger.error(f"Extract error: {e}")
+        
+    return None, None, None # Fixed: returning 3 items instead of crashing
 
 def download_with_ytdlp(stream_url, output_path, headers=None):
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
@@ -127,63 +148,62 @@ def download_with_ytdlp(stream_url, output_path, headers=None):
             if f.startswith(base_name): os.rename(os.path.join(dir_name, f), output_path); break
     return True
 
-# --- CLEANUP FUNCTIONS ---
+def download_subtitle(sub_url, output_path):
+    try:
+        resp = requests.get(sub_url, timeout=30)
+        resp.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(resp.content)
+        return True
+    except Exception as e:
+        logger.error(f"Subtitle download error: {e}")
+        return False
 
+def send_telegram_document(chat_id, file_path, caption):
+    try:
+        with open(file_path, "rb") as f:
+            files = {"document": (os.path.basename(file_path), f, "application/octet-stream")}
+            data = {"chat_id": chat_id, "caption": caption}
+            resp = requests.post(f"{TELEGRAM_API}/sendDocument", data=data, files=files, timeout=60)
+        return resp.ok
+    except Exception as e:
+        logger.error(f"Telegram sub upload error: {e}")
+        return False
+
+# --- CLEANUP FUNCTIONS ---
 def cleanup_hf():
-    logger.info("Checking HF storage limits...")
     try:
         files = hf_api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset")
         if len(files) > 40:
-            to_delete = files[:10]
-            for f in to_delete:
+            for f in files[:10]:
                 hf_api.delete_file(path_in_repo=f, repo_id=HF_REPO_ID, repo_type="dataset")
-                logger.info(f"Deleted from HF: {f}")
-    except Exception as e:
-        logger.error(f"HF cleanup error: {e}")
+    except Exception as e: pass
 
 def cleanup_github():
-    logger.info("Checking GitHub storage limits...")
     if not GITHUB_TOKEN or not GITHUB_REPO: return
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     try:
         resp = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases", headers=headers, timeout=30)
-        if resp.ok:
-            releases = resp.json()
-            if len(releases) >= 15:
-                to_delete = releases[10:]
-                for rel in to_delete:
-                    rel_id = rel["id"]
-                    requests.delete(f"https://api.github.com/repos/{GITHUB_REPO}/releases/{rel_id}", headers=headers)
-                    logger.info(f"Deleted GitHub Release: {rel['tag_name']}")
-    except Exception as e:
-        logger.error(f"GitHub cleanup error: {e}")
+        if resp.ok and len(resp.json()) >= 15:
+            for rel in resp.json()[10:]:
+                requests.delete(f"https://api.github.com/repos/{GITHUB_REPO}/releases/{rel['id']}", headers=headers)
+    except Exception as e: pass
 
 def cleanup_gdrive():
-    logger.info("Checking GDrive storage limits...")
     if not drive_service: return
     try:
-        results = drive_service.files().list(
-            q=f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false",
-            orderBy="createdTime desc",
-            fields="files(id, name, createdTime)"
-        ).execute()
+        results = drive_service.files().list(q=f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false", orderBy="createdTime desc", fields="files(id)").execute()
         files = results.get('files', [])
         if len(files) >= 30:
-            to_delete = files[25:]
-            for f in to_delete:
-                drive_service.files().delete(fileId=f['id']).execute()
-                logger.info(f"Deleted from GDrive: {f['name']}")
-    except Exception as e:
-        logger.error(f"GDrive cleanup error: {e}")
+            for f in files[25:]: drive_service.files().delete(fileId=f['id']).execute()
+    except Exception as e: pass
 
 # --- UPLOAD FUNCTIONS ---
-
 def upload_to_hf(file_path, filename):
     try:
         hf_api.upload_file(path_or_fileobj=file_path, path_in_repo=filename, repo_id=HF_REPO_ID, repo_type="dataset")
         return f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{filename}"
-    except Exception as e:
-        logger.error(f"HF Upload error: {e}"); return None
+    except Exception as e: return None
 
 def upload_github_release(file_path, filename):
     if not GITHUB_TOKEN or not GITHUB_REPO: return None
@@ -205,14 +225,9 @@ def upload_gdrive(file_path, filename):
         media = MediaFileUpload(file_path, resumable=True)
         file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
         file_id = file.get('id')
-        drive_service.permissions().create(
-            fileId=file_id,
-            body={'type': 'anyone', 'role': 'reader'}
-        ).execute()
+        drive_service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}).execute()
         return f"https://drive.google.com/uc?export=download&id={file_id}"
-    except Exception as e:
-        logger.error(f"GDrive Upload error: {e}")
-        return None
+    except Exception as e: return None
 
 # --- Pagination Helper ---
 def build_episode_keyboard(episodes, page=0, per_page=24):
@@ -268,15 +283,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Choose storage destination:", reply_markup=InlineKeyboardMarkup(kb))
     elif d.startswith("dest_"):
         dest = d.split("_")[1]; aid, title, ep, audio, chat_id = context.user_data['aid'], context.user_data['title'], context.user_data['ep'], context.user_data['audio'], q.message.chat_id
-        await q.edit_message_text("⏳ Extracting stream...")
-        url, headers = await asyncio.to_thread(extract_stream, aid, ep, audio)
-        if not url: await q.edit_message_text("❌ Extract failed."); return
+        await q.edit_message_text("⏳ Extracting stream & subtitles...")
+        
+        # Use the fixed function that returns 3 items
+        url, headers, sub_url = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio)
+        
+        if not url: 
+            await q.edit_message_text("❌ Extract failed. The stream may not be available for this episode yet.")
+            return
+            
         safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip().replace(" ", "_")
         filename = f"{safe_title}_EP{ep}_{audio.upper()}.mp4"
         out = f"/tmp/{filename}"
+        
         await q.edit_message_text("⏳ Downloading (original quality)...")
         if not await asyncio.to_thread(download_with_ytdlp, url, out, headers):
             await q.edit_message_text("❌ Download failed."); return
+        
+        # Download and send subtitle immediately
+        if sub_url:
+            await q.edit_message_text("⏳ Downloading English subtitle...")
+            sub_filename = f"{safe_title}_EP{ep}_English.srt"
+            sub_out = f"/tmp/{sub_filename}"
+            if await asyncio.to_thread(download_subtitle, sub_url, sub_out):
+                await asyncio.to_thread(send_telegram_document, chat_id, sub_out, f"📄 Subtitle for {title} - EP {ep}")
+                os.remove(sub_out)
+            else:
+                await q.edit_message_text("⚠️ Video downloaded, but subtitle failed to download.")
         
         size_mb = os.path.getsize(out) / (1024 * 1024)
         await q.edit_message_text(f"🧹 Running cleanup & 📤 Uploading to {dest.upper()} ({size_mb:.1f} MB)...")
