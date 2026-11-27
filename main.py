@@ -101,10 +101,26 @@ def get_episodes(anime_id):
     except Exception as e:
         logger.error(f"Episode error: {e}"); return []
 
-def extract_stream_and_subs(anime_id, ep, audio, quality):
+def extract_stream_and_subs(anime_id, ep, audio, quality, provider=None):
+    """
+    Extracts stream and subtitles.
+    If audio is 'dub', forces a provider known to have dubs and filters streams by audio type.
+    """
     try:
         params = {"e": ep, "type": audio, "quality": quality}
+        if provider:
+            params["provider"] = provider
+        elif audio == "dub":
+            # Force a provider that is known to have working dubs
+            params["provider"] = "anineko" 
+            
         resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=90)
+        
+        # If the requested dub is not available, the API returns 404
+        if resp.status_code == 404:
+            logger.warning(f"Dub not available for {anime_id} EP {ep}")
+            return None, None, None, "Dub not available for this episode."
+            
         resp.raise_for_status()
         data = resp.json()
         
@@ -120,32 +136,41 @@ def extract_stream_and_subs(anime_id, ep, audio, quality):
                 sub_url = track.get("url", track.get("file"))
                 break
                 
-        # Find stream matching quality
+        # Filter streams by audio type (sub/dub)
+        best_stream = None
         if streams:
-            best_stream = None
             for s in streams:
-                s_qual = str(s.get("quality", ""))
-                if quality in s_qual or s_qual == quality:
-                    best_stream = s
-                    break
+                # Check if the stream has an audio field matching our request
+                s_audio = s.get("audio", "").lower()
+                if s_audio == audio:  # 'dub' or 'sub'
+                    s_qual = str(s.get("quality", ""))
+                    if quality in s_qual or s_qual == quality:
+                        best_stream = s
+                        break
+            # Fallback: if no stream matched the audio field, try matching just quality
             if not best_stream:
-                best_stream = streams[0] # Fallback
+                for s in streams:
+                    s_qual = str(s.get("quality", ""))
+                    if quality in s_qual or s_qual == quality:
+                        best_stream = s
+                        break
+            # Final fallback: just take the first stream
+            if not best_stream:
+                best_stream = streams[0]
                 
             headers = {"Referer": best_stream.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
-            return best_stream.get("url"), headers, sub_url
+            return best_stream.get("url"), headers, sub_url, None
             
     except Exception as e:
         logger.error(f"Extract error: {e}")
         
-    return None, None, None
+    return None, None, None, "Extraction failed."
 
 def download_with_ytdlp(stream_url, output_path, headers):
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
     referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
     origin = referer.rstrip('/')
     
-    # REMOVED the forced [language=eng] filter. 
-    # The Kuhi API already gives us a stream URL specific to the requested audio type.
     cmd = [
         "yt-dlp", "--no-warnings", "--no-check-certificate",
         "--referer", referer, "--user-agent", user_agent,
@@ -164,7 +189,6 @@ def download_with_ytdlp(stream_url, output_path, headers):
 
 def download_subtitle(sub_url, output_path, headers):
     try:
-        # Use the same headers that the video stream uses to bypass the CDN block
         resp = requests.get(sub_url, headers=headers, timeout=30)
         resp.raise_for_status()
         with open(output_path, "wb") as f:
@@ -324,11 +348,15 @@ async def process_download(q, context, dest):
     chat_id = q.message.chat_id
     
     await q.edit_message_text("⏳ Extracting stream & subtitles...")
-    url, headers, sub_url = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio, qual)
+    url, headers, sub_url, err = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio, qual)
     
+    if err:
+        await q.edit_message_text(f"❌ {err}")
+        return
+        
     safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip().replace(" ", "_")
     
-    # 1. Download and Send Subtitle (Before Video)
+    # 1. Download and Send Subtitle
     sub_sent = False
     if sub_url:
         sub_filename = f"{safe_title}_EP{ep}_{audio.upper()}.srt"
