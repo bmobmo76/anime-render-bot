@@ -102,80 +102,109 @@ def get_episodes(anime_id):
     except Exception as e:
         logger.error(f"Episode error: {e}"); return []
 
-def extract_stream_and_subs(anime_id, ep, audio, quality):
+def extract_stream_and_subs(anime_id, ep, audio, quality, title):
     """Returns (stream_url, headers, subtitle_url, error)"""
     sub_url = None
     headers = None
     stream_url = None
     
-    # For dubs, we must try multiple providers and strictly verify the audio metadata
-    providers_to_try = ["anineko", "animepahe", "zoro", "gogoanime"] if audio == "dub" else [None]
-    
-    for provider in providers_to_try:
+    if audio == "dub":
+        # HiAnime API for guaranteed English dub
+        base_h = "https://hianime.to/api/v2/hianime"
+        h_headers = {"User-Agent": "Mozilla/5.0"}
         try:
-            params = {"e": ep, "type": audio, "quality": quality}
-            if provider:
-                params["provider"] = provider
+            # 1. Search
+            resp = requests.get(f"{base_h}/search", params={"q": title}, headers=h_headers, timeout=15)
+            resp.raise_for_status()
+            animes = resp.json().get("data", {}).get("animes", [])
+            if not animes:
+                return None, None, None, "Anime not found on HiAnime."
                 
-            resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=60)
+            anime_id_h = animes[0]["id"]
             
-            if resp.status_code == 404:
-                continue # Try next provider
+            # 2. Get Episodes
+            resp = requests.get(f"{base_h}/anime/{anime_id_h}/episodes", headers=h_headers, timeout=15)
+            resp.raise_for_status()
+            episodes = resp.json().get("data", {}).get("episodes", [])
+            
+            ep_id = None
+            for e in episodes:
+                if str(e["number"]) == str(ep):
+                    ep_id = e["id"]
+                    break
+                    
+            if not ep_id:
+                return None, None, None, "Episode not found on HiAnime."
                 
+            # 3. Get Sources (category=dub)
+            resp = requests.get(f"{base_h}/episode/sources", params={"animeEpisodeId": ep_id, "category": "dub"}, headers=h_headers, timeout=15)
             resp.raise_for_status()
             data = resp.json()
             
-            streams = data.get("streams", [])
-            subtitles = data.get("subtitles", []) or data.get("tracks", [])
+            sources = data.get("data", {}).get("sources", [])
+            if not sources:
+                return None, None, None, "No dub sources found on HiAnime."
+                
+            stream_url = sources[0]["url"]
+            headers = {"Referer": "https://hianime.to/", "User-Agent": "Mozilla/5.0"}
             
-            # Find English subtitle (only if we don't have one yet)
-            if not sub_url:
+        except Exception as e:
+            logger.error(f"HiAnime dub error: {e}")
+            return None, None, None, f"HiAnime error: {e}"
+            
+        # Get subtitles from Kuhi (sub type)
+        try:
+            params = {"e": ep, "type": "sub"}
+            resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=30)
+            if resp.ok:
+                data = resp.json()
+                subtitles = data.get("subtitles", []) or data.get("tracks", [])
                 for track in subtitles:
                     lang = track.get("lang", track.get("language", "")).lower()
                     label = track.get("label", "").lower()
                     if "en" in lang or "english" in label:
                         sub_url = track.get("url", track.get("file"))
                         break
-                        
+        except Exception:
+            pass
+            
+    else:
+        # Use Kuhi for sub
+        try:
+            params = {"e": ep, "type": "sub", "quality": quality}
+            resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=90)
+            resp.raise_for_status()
+            data = resp.json()
+            streams = data.get("streams", [])
+            subtitles = data.get("subtitles", []) or data.get("tracks", [])
+            
+            for track in subtitles:
+                lang = track.get("lang", track.get("language", "")).lower()
+                label = track.get("label", "").lower()
+                if "en" in lang or "english" in label:
+                    sub_url = track.get("url", track.get("file"))
+                    break
+                    
             if streams:
-                # Strict verification for dubs
+                best_stream = None
                 for s in streams:
-                    s_audio = str(s.get("audio", "")).lower()
-                    # If we requested dub, ensure the stream is actually a dub
-                    if audio == "dub" and not ("dub" in s_audio or "eng" in s_audio):
-                        continue
-                        
                     s_qual = str(s.get("quality", ""))
                     if quality in s_qual or s_qual == quality:
-                        stream_url = s.get("url")
-                        headers = {"Referer": s.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
+                        best_stream = s
                         break
-                        
-                # If quality didn't match, just take the first verified stream
-                if not stream_url:
-                    for s in streams:
-                        s_audio = str(s.get("audio", "")).lower()
-                        if audio == "dub" and not ("dub" in s_audio or "eng" in s_audio):
-                            continue
-                        stream_url = s.get("url")
-                        headers = {"Referer": s.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
-                        break
-                        
-            if stream_url:
-                break # We found a valid stream, stop looping through providers
-                
+                if not best_stream:
+                    best_stream = streams[0]
+                stream_url = best_stream.get("url")
+                headers = {"Referer": best_stream.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
         except Exception as e:
-            logger.error(f"Extraction error with provider {provider}: {e}")
-            continue
+            logger.error(f"Kuhi sub extraction error: {e}")
+            return None, None, None, "Sub extraction failed."
             
-    if not stream_url:
-        return None, None, sub_url, "Could not find a valid stream for the selected audio type."
-        
     return stream_url, headers, sub_url, None
 
 def download_with_ytdlp(stream_url, output_path, headers):
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
-    referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
+    referer = headers.get("Referer", "https://hianime.to/") if headers else "https://hianime.to/"
     origin = referer.rstrip('/')
     
     cmd = [
@@ -355,7 +384,7 @@ async def process_download(q, context, dest):
     chat_id = q.message.chat_id
     
     await q.edit_message_text("⏳ Extracting stream & subtitles...")
-    url, headers, sub_url, err = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio, qual)
+    url, headers, sub_url, err = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio, qual, title)
     
     if err:
         await q.edit_message_text(f"❌ {err}")
