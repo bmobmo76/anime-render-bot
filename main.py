@@ -38,7 +38,7 @@ GDRIVE_REFRESH_TOKEN = os.environ.get("GDRIVE_REFRESH_TOKEN")
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-KUHI_API = "https://my-kuhi-api.onrender.com"
+KUHI_API = "https://my-kuhi-api.onrender.com" # <--- ENSURE THIS IS YOUR URL
 
 # --- Setup a robust HTTP session ---
 session = requests.Session()
@@ -101,10 +101,11 @@ def get_episodes(anime_id):
     except Exception as e:
         logger.error(f"Episode error: {e}"); return []
 
-def extract_stream_and_subs(anime_id, ep, audio):
+def extract_stream_and_subs(anime_id, ep, audio, quality):
     """Returns (stream_url, headers, subtitle_url)"""
     try:
-        resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params={"e": ep, "type": audio}, timeout=90)
+        params = {"e": ep, "type": audio, "quality": quality}
+        resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=90)
         resp.raise_for_status()
         data = resp.json()
         
@@ -120,25 +121,41 @@ def extract_stream_and_subs(anime_id, ep, audio):
                 sub_url = track.get("url", track.get("file"))
                 break
                 
-        # Find HLS stream
+        # Find stream matching quality
         if streams:
+            best_stream = None
             for s in streams:
-                if s.get("type") == "hls":
-                    return s.get("url"), {"Referer": s.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}, sub_url
-            # Fallback to first stream if no HLS
-            s = streams[0]
-            return s.get("url"), {"Referer": s.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}, sub_url
+                s_qual = str(s.get("quality", ""))
+                if quality in s_qual or s_qual == quality:
+                    best_stream = s
+                    break
+            if not best_stream:
+                best_stream = streams[0] # Fallback
+                
+            headers = {"Referer": best_stream.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
+            return best_stream.get("url"), headers, sub_url
             
     except Exception as e:
         logger.error(f"Extract error: {e}")
         
-    return None, None, None # Fixed: returning 3 items instead of crashing
+    return None, None, None
 
-def download_with_ytdlp(stream_url, output_path, headers=None):
+def download_with_ytdlp(stream_url, output_path, headers, audio_type):
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
     referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
     origin = referer.rstrip('/')
-    cmd = ["yt-dlp", "--no-warnings", "--no-check-certificate", "--referer", referer, "--user-agent", user_agent, "--add-header", f"Origin:{origin}", "--merge-output-format", "mp4", "-o", output_path, stream_url]
+    
+    # Force the correct audio track if possible (eng for dub, jpn for sub)
+    audio_lang = "eng" if audio_type == "dub" else "jpn"
+    format_str = f"bestvideo[ext=mp4]+bestaudio[language={audio_lang}]/bestvideo+bestaudio/best"
+    
+    cmd = [
+        "yt-dlp", "--no-warnings", "--no-check-certificate",
+        "--referer", referer, "--user-agent", user_agent,
+        "--add-header", f"Origin:{origin}",
+        "-f", format_str,
+        "--merge-output-format", "mp4", "-o", output_path, stream_url
+    ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         logger.error(f"yt-dlp error: {result.stderr}"); return False
@@ -148,9 +165,9 @@ def download_with_ytdlp(stream_url, output_path, headers=None):
             if f.startswith(base_name): os.rename(os.path.join(dir_name, f), output_path); break
     return True
 
-def download_subtitle(sub_url, output_path):
+def download_subtitle(sub_url, output_path, headers):
     try:
-        resp = requests.get(sub_url, timeout=30)
+        resp = requests.get(sub_url, headers=headers, timeout=30)
         resp.raise_for_status()
         with open(output_path, "wb") as f:
             f.write(resp.content)
@@ -175,8 +192,7 @@ def cleanup_hf():
     try:
         files = hf_api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset")
         if len(files) > 40:
-            for f in files[:10]:
-                hf_api.delete_file(path_in_repo=f, repo_id=HF_REPO_ID, repo_type="dataset")
+            for f in files[:10]: hf_api.delete_file(path_in_repo=f, repo_id=HF_REPO_ID, repo_type="dataset")
     except Exception as e: pass
 
 def cleanup_github():
@@ -185,8 +201,7 @@ def cleanup_github():
     try:
         resp = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases", headers=headers, timeout=30)
         if resp.ok and len(resp.json()) >= 15:
-            for rel in resp.json()[10:]:
-                requests.delete(f"https://api.github.com/repos/{GITHUB_REPO}/releases/{rel['id']}", headers=headers)
+            for rel in resp.json()[10:]: requests.delete(f"https://api.github.com/repos/{GITHUB_REPO}/releases/{rel['id']}", headers=headers)
     except Exception as e: pass
 
 def cleanup_gdrive():
@@ -266,72 +281,107 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not eps: await q.edit_message_text("❌ No episodes."); return
         context.user_data['aid'], context.user_data['title'], context.user_data['eps'] = aid, title, eps
         await q.edit_message_text(f"**{title}**\nPage 1:", reply_markup=build_episode_keyboard(eps))
+        
     elif d.startswith("page_"):
         page = int(d.split("_")[1])
         await q.edit_message_text(f"**{context.user_data['title']}**\nPage {page+1}:", reply_markup=build_episode_keyboard(context.user_data['eps'], page))
+        
     elif d.startswith("ep_"):
         context.user_data['ep'] = d.split("_")[1]
         kb = [[InlineKeyboardButton("SUB", callback_data="audio_sub"), InlineKeyboardButton("DUB", callback_data="audio_dub")]]
         await q.edit_message_text(f"Episode **{context.user_data['ep']}**. Choose audio:", reply_markup=InlineKeyboardMarkup(kb))
+        
     elif d.startswith("audio_"):
         context.user_data['audio'] = d.split("_")[1]
+        kb = [[InlineKeyboardButton("480p", callback_data="qual_480"), InlineKeyboardButton("720p", callback_data="qual_720")]]
+        await q.edit_message_text(f"Audio: **{context.user_data['audio'].upper()}**. Choose quality:", reply_markup=InlineKeyboardMarkup(kb))
+        
+    elif d.startswith("qual_"):
+        context.user_data['qual'] = d.split("_")[1]
         kb = [
-            [InlineKeyboardButton("📥 Hugging Face Link", callback_data="dest_hf")],
-            [InlineKeyboardButton("🐙 GitHub Link", callback_data="dest_gh")],
-            [InlineKeyboardButton("☁️ Google Drive Link", callback_data="dest_gd")]
+            [InlineKeyboardButton("🎬 Video + Subtitle", callback_data="mode_both")],
+            [InlineKeyboardButton("📄 Subtitle Only", callback_data="mode_sub")]
         ]
-        await q.edit_message_text("Choose storage destination:", reply_markup=InlineKeyboardMarkup(kb))
-    elif d.startswith("dest_"):
-        dest = d.split("_")[1]; aid, title, ep, audio, chat_id = context.user_data['aid'], context.user_data['title'], context.user_data['ep'], context.user_data['audio'], q.message.chat_id
-        await q.edit_message_text("⏳ Extracting stream & subtitles...")
+        await q.edit_message_text(f"Quality: **{context.user_data['qual']}p**. What do you want to download?", reply_markup=InlineKeyboardMarkup(kb))
         
-        # Use the fixed function that returns 3 items
-        url, headers, sub_url = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio)
-        
-        if not url: 
-            await q.edit_message_text("❌ Extract failed. The stream may not be available for this episode yet.")
-            return
+    elif d.startswith("mode_"):
+        mode = d.split("_")[1]
+        context.user_data['mode'] = mode
+        if mode == "sub":
+            # Trigger subtitle-only download immediately
+            await process_download(q, context, dest="sub_only")
+        else:
+            kb = [
+                [InlineKeyboardButton("📥 Hugging Face", callback_data="dest_hf")],
+                [InlineKeyboardButton("🐙 GitHub", callback_data="dest_gh")],
+                [InlineKeyboardButton("☁️ Google Drive", callback_data="dest_gd")]
+            ]
+            await q.edit_message_text("Choose storage destination:", reply_markup=InlineKeyboardMarkup(kb))
             
-        safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip().replace(" ", "_")
-        filename = f"{safe_title}_EP{ep}_{audio.upper()}.mp4"
-        out = f"/tmp/{filename}"
-        
-        await q.edit_message_text("⏳ Downloading (original quality)...")
-        if not await asyncio.to_thread(download_with_ytdlp, url, out, headers):
-            await q.edit_message_text("❌ Download failed."); return
-        
-        # Download and send subtitle immediately
-        if sub_url:
-            await q.edit_message_text("⏳ Downloading English subtitle...")
-            sub_filename = f"{safe_title}_EP{ep}_English.srt"
-            sub_out = f"/tmp/{sub_filename}"
-            if await asyncio.to_thread(download_subtitle, sub_url, sub_out):
-                await asyncio.to_thread(send_telegram_document, chat_id, sub_out, f"📄 Subtitle for {title} - EP {ep}")
-                os.remove(sub_out)
-            else:
-                await q.edit_message_text("⚠️ Video downloaded, but subtitle failed to download.")
-        
-        size_mb = os.path.getsize(out) / (1024 * 1024)
-        await q.edit_message_text(f"🧹 Running cleanup & 📤 Uploading to {dest.upper()} ({size_mb:.1f} MB)...")
-        
-        await asyncio.to_thread(cleanup_hf)
-        await asyncio.to_thread(cleanup_github)
-        await asyncio.to_thread(cleanup_gdrive)
+    elif d.startswith("dest_"):
+        dest = d.split("_")[1]
+        await process_download(q, context, dest=dest)
 
-        if dest == "hf":
-            link = await asyncio.to_thread(upload_to_hf, out, filename)
-            if link: await q.edit_message_text(f"✅ **Hugging Face Link Ready**\n\n📥 [Click here to download]({link})", disable_web_page_preview=True)
-            else: await q.edit_message_text("❌ HF upload failed.")
-        elif dest == "gh":
-            link = await asyncio.to_thread(upload_github_release, out, filename)
-            if link: await q.edit_message_text(f"✅ **GitHub Release Link Ready**\n\n🐙 [Click here to download]({link})", disable_web_page_preview=True)
-            else: await q.edit_message_text("❌ GitHub upload failed.")
-        elif dest == "gd":
-            link = await asyncio.to_thread(upload_gdrive, out, filename)
-            if link: await q.edit_message_text(f"✅ **Google Drive Link Ready**\n\n☁️ [Click here to download]({link})\n\n*If GDrive shows a virus warning, click `Download anyway`.*", disable_web_page_preview=True)
-            else: await q.edit_message_text("❌ GDrive upload failed. Check your OAuth settings.")
+async def process_download(q, context, dest):
+    aid, title, ep, audio, qual = context.user_data['aid'], context.user_data['title'], context.user_data['ep'], context.user_data['audio'], context.user_data['qual']
+    chat_id = q.message.chat_id
+    
+    await q.edit_message_text("⏳ Extracting stream & subtitles...")
+    url, headers, sub_url = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio, qual)
+    
+    safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip().replace(" ", "_")
+    
+    # 1. Download and Send Subtitle
+    sub_sent = False
+    if sub_url:
+        sub_filename = f"{safe_title}_EP{ep}_{audio.upper()}.srt"
+        sub_out = f"/tmp/{sub_filename}"
+        await q.edit_message_text("⏳ Downloading subtitle...")
+        if await asyncio.to_thread(download_subtitle, sub_url, sub_out, headers):
+            if await asyncio.to_thread(send_telegram_document, chat_id, sub_out, f"📄 Subtitle for {title} - EP {ep}"):
+                sub_sent = True
+            os.remove(sub_out)
+            
+    if dest == "sub_only":
+        if sub_sent:
+            await q.edit_message_text("✅ Subtitle sent successfully.")
+        else:
+            await q.edit_message_text("❌ Failed to download or send subtitle.")
+        return
+
+    # 2. Download and Upload Video
+    if not url: 
+        await q.edit_message_text("❌ Extract stream failed. The video may not be available.")
+        return
         
-        os.remove(out)
+    filename = f"{safe_title}_EP{ep}_{audio.upper()}_{qual}p.mp4"
+    out = f"/tmp/{filename}"
+    
+    await q.edit_message_text("⏳ Downloading video (this may take a while)...")
+    if not await asyncio.to_thread(download_with_ytdlp, url, out, headers, audio):
+        await q.edit_message_text("❌ Video download failed."); return
+    
+    size_mb = os.path.getsize(out) / (1024 * 1024)
+    await q.edit_message_text(f"🧹 Running cleanup & 📤 Uploading to {dest.upper()} ({size_mb:.1f} MB)...")
+    
+    await asyncio.to_thread(cleanup_hf)
+    await asyncio.to_thread(cleanup_github)
+    await asyncio.to_thread(cleanup_gdrive)
+
+    if dest == "hf":
+        link = await asyncio.to_thread(upload_to_hf, out, filename)
+        if link: await q.edit_message_text(f"✅ **Hugging Face Link Ready**\n\n📥 [Click here to download]({link})", disable_web_page_preview=True)
+        else: await q.edit_message_text("❌ HF upload failed.")
+    elif dest == "gh":
+        link = await asyncio.to_thread(upload_github_release, out, filename)
+        if link: await q.edit_message_text(f"✅ **GitHub Release Link Ready**\n\n🐙 [Click here to download]({link})", disable_web_page_preview=True)
+        else: await q.edit_message_text("❌ GitHub upload failed.")
+    elif dest == "gd":
+        link = await asyncio.to_thread(upload_gdrive, out, filename)
+        if link: await q.edit_message_text(f"✅ **Google Drive Link Ready**\n\n☁️ [Click here to download]({link})\n\n*If GDrive shows a virus warning, click `Download anyway`.*", disable_web_page_preview=True)
+        else: await q.edit_message_text("❌ GDrive upload failed.")
+    
+    os.remove(out)
 
 async def error_handler(update, context):
     logger.error(f"Error: {context.error}")
