@@ -6,6 +6,7 @@ import uuid
 import requests
 import logging
 import asyncio
+import re
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -101,70 +102,91 @@ def get_episodes(anime_id):
     except Exception as e:
         logger.error(f"Episode error: {e}"); return []
 
-def extract_stream_and_subs(anime_id, ep, audio, quality, provider=None):
-    """
-    Extracts stream and subtitles.
-    If audio is 'dub', forces a provider known to have dubs and filters streams by audio type.
-    """
+def extract_dub_from_megaplay(anilist_id, episode):
+    """Directly constructs and extracts the dub stream from MegaPlay."""
+    iframe_url = f"https://megaplay.buzz/stream/ani/{anilist_id}/{episode}/dub"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://megaplay.buzz/"}
     try:
-        params = {"e": ep, "type": audio, "quality": quality}
-        if provider:
-            params["provider"] = provider
-        elif audio == "dub":
-            # Force a provider that is known to have working dubs
-            params["provider"] = "anineko" 
-            
-        resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=90)
-        
-        # If the requested dub is not available, the API returns 404
-        if resp.status_code == 404:
-            logger.warning(f"Dub not available for {anime_id} EP {ep}")
-            return None, None, None, "Dub not available for this episode."
-            
+        resp = requests.get(iframe_url, headers=headers, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
-        
-        streams = data.get("streams", [])
-        subtitles = data.get("subtitles", []) or data.get("tracks", [])
-        
-        # Find English subtitle
-        sub_url = None
-        for track in subtitles:
-            lang = track.get("lang", track.get("language", "")).lower()
-            label = track.get("label", "").lower()
-            if "en" in lang or "english" in label:
-                sub_url = track.get("url", track.get("file"))
-                break
-                
-        # Filter streams by audio type (sub/dub)
-        best_stream = None
-        if streams:
-            for s in streams:
-                # Check if the stream has an audio field matching our request
-                s_audio = s.get("audio", "").lower()
-                if s_audio == audio:  # 'dub' or 'sub'
-                    s_qual = str(s.get("quality", ""))
-                    if quality in s_qual or s_qual == quality:
-                        best_stream = s
-                        break
-            # Fallback: if no stream matched the audio field, try matching just quality
-            if not best_stream:
+        html = resp.text
+        # Look for the m3u8 URL in the page source
+        m3u8_match = re.search(r'https?://[^\s"\']+\.m3u8[^\s"\']*', html)
+        if m3u8_match:
+            return m3u8_match.group(0), headers
+        # Fallback: look for file: "..." pattern
+        file_match = re.search(r'file\s*:\s*["\']([^"\']+)["\']', html)
+        if file_match:
+            return file_match.group(1), headers
+        return None, None
+    except Exception as e:
+        logger.error(f"MegaPlay dub extraction error: {e}")
+        return None, None
+
+def extract_stream_and_subs(anime_id, ep, audio, quality):
+    """Extracts stream and subtitles. For dub, uses direct MegaPlay URL."""
+    sub_url = None
+    headers = None
+    stream_url = None
+    
+    if audio == "dub":
+        # Force direct MegaPlay extraction for guaranteed English audio
+        stream_url, headers = extract_dub_from_megaplay(anime_id, ep)
+        if not stream_url:
+            return None, None, None, "Dub stream not found on MegaPlay."
+    else:
+        # Use Kuhi API for sub
+        try:
+            params = {"e": ep, "type": "sub", "quality": quality}
+            resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=90)
+            resp.raise_for_status()
+            data = resp.json()
+            streams = data.get("streams", [])
+            subtitles = data.get("subtitles", []) or data.get("tracks", [])
+            
+            # Find English subtitle
+            for track in subtitles:
+                lang = track.get("lang", track.get("language", "")).lower()
+                label = track.get("label", "").lower()
+                if "en" in lang or "english" in label:
+                    sub_url = track.get("url", track.get("file"))
+                    break
+                    
+            if streams:
+                # Filter by quality
+                best_stream = None
                 for s in streams:
                     s_qual = str(s.get("quality", ""))
                     if quality in s_qual or s_qual == quality:
                         best_stream = s
                         break
-            # Final fallback: just take the first stream
-            if not best_stream:
-                best_stream = streams[0]
-                
-            headers = {"Referer": best_stream.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
-            return best_stream.get("url"), headers, sub_url, None
+                if not best_stream:
+                    best_stream = streams[0]
+                stream_url = best_stream.get("url")
+                headers = {"Referer": best_stream.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
+        except Exception as e:
+            logger.error(f"Kuhi sub extraction error: {e}")
+            return None, None, None, "Sub extraction failed."
             
-    except Exception as e:
-        logger.error(f"Extract error: {e}")
-        
-    return None, None, None, "Extraction failed."
+    # For dub, we still want subtitles. Try to get them from Kuhi API.
+    if audio == "dub" and not sub_url:
+        try:
+            # Request sub type just for subtitles
+            params = {"e": ep, "type": "sub"}
+            resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=30)
+            if resp.ok:
+                data = resp.json()
+                subtitles = data.get("subtitles", []) or data.get("tracks", [])
+                for track in subtitles:
+                    lang = track.get("lang", track.get("language", "")).lower()
+                    label = track.get("label", "").lower()
+                    if "en" in lang or "english" in label:
+                        sub_url = track.get("url", track.get("file"))
+                        break
+        except Exception:
+            pass
+            
+    return stream_url, headers, sub_url, None
 
 def download_with_ytdlp(stream_url, output_path, headers):
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
