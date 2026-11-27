@@ -6,24 +6,21 @@ import uuid
 import requests
 import logging
 import asyncio
-import json
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from huggingface_hub import HfApi
 
 # Google API imports
-from google.oauth2 import service_account
+import google.auth
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 # --- Setup Logging ---
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    stream=sys.stdout,
-    force=True
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO, stream=sys.stdout, force=True)
 logger = logging.getLogger(__name__)
 
 # --- Environment Variables ---
@@ -31,407 +28,280 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", 8080))
 
-# GitHub Config
+HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_REPO_ID = os.environ.get("HF_REPO_ID")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO") # e.g., "bmobmo76/anime-storage"
+GITHUB_REPO = os.environ.get("GITHUB_REPO")
 
-# Google Drive Config
-GDRIVE_CLIENT_EMAIL = os.environ.get("GDRIVE_CLIENT_EMAIL")
-GDRIVE_PRIVATE_KEY = os.environ.get("GDRIVE_PRIVATE_KEY")
+GDRIVE_CLIENT_ID = os.environ.get("GDRIVE_CLIENT_ID")
+GDRIVE_CLIENT_SECRET = os.environ.get("GDRIVE_CLIENT_SECRET")
+GDRIVE_REFRESH_TOKEN = os.environ.get("GDRIVE_REFRESH_TOKEN")
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-KUHI_API = "https://my-kuhi-api.onrender.com" # <--- ENSURE THIS IS YOUR URL
+KUHI_API = "https://my-kuhi-api.onrender.com"
 
 # --- Setup a robust HTTP session ---
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=2, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET"])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
-# --- Google Drive Initialization ---
-def get_drive_service():
-    if not GDRIVE_CLIENT_EMAIL or not GDRIVE_PRIVATE_KEY or not GDRIVE_FOLDER_ID:
+# --- APIs Init ---
+hf_api = HfApi(token=HF_TOKEN)
+
+def get_drive_service_oauth():
+    if not all([GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN]):
+        logger.warning("Google Drive OAuth credentials not fully set. GDrive will be disabled.")
         return None
     try:
-        # Handle newlines in private key
-        private_key = GDRIVE_PRIVATE_KEY.replace("\\n", "\n")
-        creds_info = {
-            "type": "service_account",
-            "client_email": GDRIVE_CLIENT_EMAIL,
-            "private_key": private_key,
-            "token_uri": "https://oauth2.googleapis.com/token",
-        }
-        creds = service_account.Credentials.from_service_account_info(creds_info)
+        creds = Credentials(
+            token=None,
+            refresh_token=GDRIVE_REFRESH_TOKEN,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GDRIVE_CLIENT_ID,
+            client_secret=GDRIVE_CLIENT_SECRET,
+            scopes=['https://www.googleapis.com/auth/drive.file']
+        )
+        creds.refresh(Request())
         return build('drive', 'v3', credentials=creds)
     except Exception as e:
-        logger.error(f"Google Drive init error: {e}")
+        logger.error(f"GDrive OAuth init error: {e}")
         return None
 
-drive_service = get_drive_service()
+drive_service = get_drive_service_oauth()
 
 # --- Helper Functions ---
 
 def get_text(item):
-    if isinstance(item, str):
-        return item
+    if isinstance(item, str): return item
     if isinstance(item, dict):
         for key in ["en", "english", "romaji", "name", "title"]:
-            if key in item and isinstance(item[key], str):
-                return item[key]
+            if key in item and isinstance(item[key], str): return item[key]
         for val in item.values():
-            if isinstance(val, str):
-                return val
+            if isinstance(val, str): return val
     return "Unknown Title"
 
 def search_kuhi(query):
-    logger.info(f"Searching Kuhi for: {query}")
     try:
         resp = session.get(f"{KUHI_API}/anime/search", params={"query": query, "page": 1, "per_page": 10}, timeout=60)
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("results", [])
+        return resp.json().get("results", [])
     except Exception as e:
-        logger.error(f"Kuhi search error: {e}")
-        return []
+        logger.error(f"Search error: {e}"); return []
 
 def get_episodes(anime_id):
-    logger.info(f"Fetching episodes for anime ID: {anime_id}")
     try:
         resp = session.get(f"{KUHI_API}/anime/episodes/{anime_id}", timeout=90)
         resp.raise_for_status()
-        data = resp.json()
-        
-        episodes_set = set()
-        providers = data.get("providers", {})
-        for provider_data in providers.values():
-            ep_data = provider_data.get("episodes", {})
-            for audio in ["sub", "dub"]:
-                for ep in ep_data.get(audio, []):
-                    if isinstance(ep, dict) and "number" in ep:
-                        episodes_set.add(int(ep["number"]))
-                    elif isinstance(ep, (int, str)) and str(ep).isdigit():
-                        episodes_set.add(int(ep))
-        
-        episodes = sorted(list(episodes_set))
-        logger.info(f"Fetched {len(episodes)} episodes")
-        return episodes
+        eps = set()
+        for p in resp.json().get("providers", {}).values():
+            for a in ["sub", "dub"]:
+                for e in p.get("episodes", {}).get(a, []):
+                    if isinstance(e, dict) and "number" in e: eps.add(int(e["number"]))
+                    elif isinstance(e, (int, str)) and str(e).isdigit(): eps.add(int(e))
+        return sorted(list(eps))
     except Exception as e:
-        logger.error(f"Episode fetch error: {e}")
-        return []
+        logger.error(f"Episode error: {e}"); return []
 
-def extract_stream(anime_id, episode_number, audio_type):
-    logger.info(f"Extracting stream for {anime_id} EP {episode_number} ({audio_type})")
+def extract_stream(anime_id, ep, audio):
     try:
-        params = {"e": episode_number, "type": audio_type}
-        resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=90)
+        resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params={"e": ep, "type": audio}, timeout=90)
         resp.raise_for_status()
-        data = resp.json()
-        
-        streams = data.get("streams", [])
-        if not streams:
-            logger.warning("No streams found in response.")
-            return None, None
-        
-        for stream in streams:
-            if stream.get("type") == "hls":
-                stream_url = stream.get("url")
-                headers = {
-                    "Referer": stream.get("referer", "https://megaplay.buzz/"),
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                }
-                return stream_url, headers
-        
-        stream = streams[0]
-        stream_url = stream.get("url")
-        headers = {
-            "Referer": stream.get("referer", "https://megaplay.buzz/"),
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        return stream_url, headers
+        for s in resp.json().get("streams", []):
+            if s.get("type") == "hls":
+                return s["url"], {"Referer": s.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
     except Exception as e:
-        logger.error(f"Stream extraction error: {e}")
-        return None, None
+        logger.error(f"Extract error: {e}"); return None, None
 
 def download_with_ytdlp(stream_url, output_path, headers=None):
-    logger.info("Starting yt-dlp download...")
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
     referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
     origin = referer.rstrip('/')
-
-    cmd = [
-        "yt-dlp",
-        "--no-warnings",
-        "--no-check-certificate",
-        "--referer", referer,
-        "--user-agent", user_agent,
-        "--add-header", f"Origin:{origin}",
-        "--merge-output-format", "mp4",
-        "-o", output_path,
-        stream_url
-    ]
-    
+    cmd = ["yt-dlp", "--no-warnings", "--no-check-certificate", "--referer", referer, "--user-agent", user_agent, "--add-header", f"Origin:{origin}", "--merge-output-format", "mp4", "-o", output_path, stream_url]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error(f"yt-dlp error: {result.stderr}")
-        return False
-    
+        logger.error(f"yt-dlp error: {result.stderr}"); return False
     if not os.path.exists(output_path):
-        dir_name = os.path.dirname(output_path)
-        base_name = os.path.basename(output_path).split('.')[0]
+        dir_name = os.path.dirname(output_path); base_name = os.path.basename(output_path).split('.')[0]
         for f in os.listdir(dir_name):
-            if f.startswith(base_name):
-                os.rename(os.path.join(dir_name, f), output_path)
-                break
-                
-    logger.info("yt-dlp download complete.")
+            if f.startswith(base_name): os.rename(os.path.join(dir_name, f), output_path); break
     return True
 
-# --- Destination Handlers ---
+# --- CLEANUP FUNCTIONS ---
 
-def upload_telegram_document(chat_id, file_path, caption):
-    logger.info("Uploading to Telegram (as Document)...")
+def cleanup_hf():
+    logger.info("Checking HF storage limits...")
     try:
-        with open(file_path, "rb") as f:
-            files = {"document": (os.path.basename(file_path), f, "application/octet-stream")}
-            data = {"chat_id": chat_id, "caption": caption}
-            resp = requests.post(f"{TELEGRAM_API}/sendDocument", data=data, files=files, timeout=300)
-        return resp.ok
+        files = hf_api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset")
+        if len(files) > 40:
+            to_delete = files[:10]
+            for f in to_delete:
+                hf_api.delete_file(path_in_repo=f, repo_id=HF_REPO_ID, repo_type="dataset")
+                logger.info(f"Deleted from HF: {f}")
     except Exception as e:
-        logger.error(f"Telegram upload error: {e}")
-        return False
+        logger.error(f"HF cleanup error: {e}")
+
+def cleanup_github():
+    logger.info("Checking GitHub storage limits...")
+    if not GITHUB_TOKEN or not GITHUB_REPO: return
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    try:
+        resp = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases", headers=headers, timeout=30)
+        if resp.ok:
+            releases = resp.json()
+            if len(releases) >= 15:
+                to_delete = releases[10:]
+                for rel in to_delete:
+                    rel_id = rel["id"]
+                    requests.delete(f"https://api.github.com/repos/{GITHUB_REPO}/releases/{rel_id}", headers=headers)
+                    logger.info(f"Deleted GitHub Release: {rel['tag_name']}")
+    except Exception as e:
+        logger.error(f"GitHub cleanup error: {e}")
+
+def cleanup_gdrive():
+    logger.info("Checking GDrive storage limits...")
+    if not drive_service: return
+    try:
+        results = drive_service.files().list(
+            q=f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false",
+            orderBy="createdTime desc",
+            fields="files(id, name, createdTime)"
+        ).execute()
+        files = results.get('files', [])
+        if len(files) >= 30:
+            to_delete = files[25:]
+            for f in to_delete:
+                drive_service.files().delete(fileId=f['id']).execute()
+                logger.info(f"Deleted from GDrive: {f['name']}")
+    except Exception as e:
+        logger.error(f"GDrive cleanup error: {e}")
+
+# --- UPLOAD FUNCTIONS ---
+
+def upload_to_hf(file_path, filename):
+    try:
+        hf_api.upload_file(path_or_fileobj=file_path, path_in_repo=filename, repo_id=HF_REPO_ID, repo_type="dataset")
+        return f"https://huggingface.co/datasets/{HF_REPO_ID}/resolve/main/{filename}"
+    except Exception as e:
+        logger.error(f"HF Upload error: {e}"); return None
 
 def upload_github_release(file_path, filename):
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return "Missing GitHub Config."
-    logger.info("Uploading to GitHub Release...")
+    if not GITHUB_TOKEN or not GITHUB_REPO: return None
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     tag = f"ep-{uuid.uuid4().hex[:6]}"
-    
-    # Create Release
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
-    data = {"tag_name": tag, "name": filename, "draft": False, "prerelease": False}
-    resp = requests.post(url, headers=headers, json=data, timeout=30)
-    if not resp.ok:
-        return f"GitHub Release Error: {resp.text}"
-    
+    resp = requests.post(f"https://api.github.com/repos/{GITHUB_REPO}/releases", headers=headers, json={"tag_name": tag, "name": filename}, timeout=30)
+    if not resp.ok: return None
     release_data = resp.json()
-    upload_url_template = release_data["upload_url"]
-    upload_url = upload_url_template.replace("{?name,label}", f"?name={filename}")
-    
-    # Upload Asset
+    upload_url = release_data["upload_url"].replace("{?name,label}", f"?name={filename}")
     with open(file_path, "rb") as f:
         headers["Content-Type"] = "application/octet-stream"
         resp = requests.post(upload_url, headers=headers, data=f, timeout=600)
-        
-    if resp.ok:
-        return release_data["html_url"]
-    return f"GitHub Upload Error: {resp.text}"
+    return release_data["html_url"] if resp.ok else None
 
 def upload_gdrive(file_path, filename):
-    if not drive_service:
-        return "Missing Google Drive Config."
-    logger.info("Uploading to Google Drive...")
+    if not drive_service: return None
     try:
         file_metadata = {'name': filename, 'parents': [GDRIVE_FOLDER_ID]}
         media = MediaFileUpload(file_path, resumable=True)
-        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
-        
+        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
         file_id = file.get('id')
-        # Make it publicly readable
-        drive_service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}).execute()
-        
-        # Direct download link
-        direct_link = f"https://drive.google.com/uc?export=download&id={file_id}"
-        return direct_link
+        drive_service.permissions().create(
+            fileId=file_id,
+            body={'type': 'anyone', 'role': 'reader'}
+        ).execute()
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
     except Exception as e:
-        logger.error(f"GDrive Error: {e}")
-        return f"GDrive Error: {str(e)}"
+        logger.error(f"GDrive Upload error: {e}")
+        return None
 
 # --- Pagination Helper ---
 def build_episode_keyboard(episodes, page=0, per_page=24):
-    keyboard = []
-    row = []
-    start = page * per_page
-    end = start + per_page
-    page_eps = episodes[start:end]
-    
-    for ep_num in page_eps:
-        row.append(InlineKeyboardButton(f"EP {ep_num}", callback_data=f"ep_{ep_num}"))
-        if len(row) == 4:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-        
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"page_{page-1}"))
-    if end < len(episodes):
-        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page+1}"))
-        
-    if nav_row:
-        keyboard.append(nav_row)
-        
+    keyboard, row = [], []
+    start, end = page * per_page, (page + 1) * per_page
+    for ep in episodes[start:end]:
+        row.append(InlineKeyboardButton(f"EP {ep}", callback_data=f"ep_{ep}"))
+        if len(row) == 4: keyboard.append(row); row = []
+    if row: keyboard.append(row)
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"page_{page-1}"))
+    if end < len(episodes): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page+1}"))
+    if nav: keyboard.append(nav)
     return InlineKeyboardMarkup(keyboard)
 
 # --- Bot Handlers ---
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 **Anime Downloader Bot**\n\nSend me the name of an anime to search.\nExample: `Blue Box`")
+    await update.message.reply_text("👋 Anime Bot\nSend an anime name.")
 
 async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
     await update.message.reply_text(f"🔍 Searching for **{query}**...")
-    
     results = await asyncio.to_thread(search_kuhi, query)
-    
-    if not results:
-        await update.message.reply_text("❌ No results found. Try a different name.")
-        return
-    
-    context.user_data['search_results'] = results
-    keyboard = []
-    for i, anime in enumerate(results):
-        raw_title = anime.get('title') or anime.get('name') or f"Result {i+1}"
-        title = get_text(raw_title)
-        keyboard.append([InlineKeyboardButton(title, callback_data=f"anime_{i}")])
-    
-    await update.message.reply_text("Select an anime:", reply_markup=InlineKeyboardMarkup(keyboard))
+    if not results: await update.message.reply_text("❌ No results."); return
+    context.user_data['results'] = results
+    keyboard = [[InlineKeyboardButton(get_text(a.get('title', a.get('name', ''))), callback_data=f"anime_{i}")] for i, a in enumerate(results)]
+    await update.message.reply_text("Select:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data.startswith("anime_"):
-        index = int(data.split("_")[1])
-        anime = context.user_data['search_results'][index]
-        anime_id = anime.get('id') or anime.get('anime_id')
-        
-        raw_title = anime.get('title') or anime.get('name') or "Anime"
-        title = get_text(raw_title)
-        
-        await query.edit_message_text(f"📺 **{title}**\n\nFetching episode list...")
-        
-        episodes = await asyncio.to_thread(get_episodes, anime_id)
-        
-        if not episodes:
-            await query.edit_message_text("❌ No episodes found for this anime.")
-            return
-        
-        context.user_data['anime_id'] = anime_id
-        context.user_data['selected_title'] = title
-        context.user_data['episodes'] = episodes
-        
-        reply_markup = build_episode_keyboard(episodes, page=0)
-        await query.edit_message_text(
-            f"**{title}**\n\nSelect an episode (Page 1):", 
-            reply_markup=reply_markup
-        )
-
-    elif data.startswith("page_"):
-        page = int(data.split("_")[1])
-        episodes = context.user_data.get('episodes', [])
-        title = context.user_data.get('selected_title', 'Anime')
-        
-        reply_markup = build_episode_keyboard(episodes, page=page)
-        await query.edit_message_text(
-            f"**{title}**\n\nSelect an episode (Page {page+1}):", 
-            reply_markup=reply_markup
-        )
-
-    elif data.startswith("ep_"):
-        context.user_data['selected_ep'] = data.split("_")[1]
-        keyboard = [[InlineKeyboardButton("SUB (English Subtitles)", callback_data="audio_sub")], [InlineKeyboardButton("DUB (English Dub)", callback_data="audio_dub")]]
-        await query.edit_message_text(f"Episode **{context.user_data['selected_ep']}** selected.\nChoose audio type:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-    elif data.startswith("audio_"):
-        audio_type = data.split("_")[1]
-        context.user_data['audio_type'] = audio_type
-        
-        # Show destination options
-        keyboard = [
-            [InlineKeyboardButton("📥 Send in Telegram", callback_data="dest_telegram")],
-            [InlineKeyboardButton("🐙 GitHub Release Link", callback_data="dest_github")],
-            [InlineKeyboardButton("☁️ Google Drive Link", callback_data="dest_gdrive")]
+    q = update.callback_query; await q.answer(); d = q.data
+    if d.startswith("anime_"):
+        idx = int(d.split("_")[1]); anime = context.user_data['results'][idx]
+        aid = anime.get('id') or anime.get('anime_id'); title = get_text(anime.get('title', anime.get('name', 'Anime')))
+        await q.edit_message_text(f"📺 **{title}**\nFetching episodes...")
+        eps = await asyncio.to_thread(get_episodes, aid)
+        if not eps: await q.edit_message_text("❌ No episodes."); return
+        context.user_data['aid'], context.user_data['title'], context.user_data['eps'] = aid, title, eps
+        await q.edit_message_text(f"**{title}**\nPage 1:", reply_markup=build_episode_keyboard(eps))
+    elif d.startswith("page_"):
+        page = int(d.split("_")[1])
+        await q.edit_message_text(f"**{context.user_data['title']}**\nPage {page+1}:", reply_markup=build_episode_keyboard(context.user_data['eps'], page))
+    elif d.startswith("ep_"):
+        context.user_data['ep'] = d.split("_")[1]
+        kb = [[InlineKeyboardButton("SUB", callback_data="audio_sub"), InlineKeyboardButton("DUB", callback_data="audio_dub")]]
+        await q.edit_message_text(f"Episode **{context.user_data['ep']}**. Choose audio:", reply_markup=InlineKeyboardMarkup(kb))
+    elif d.startswith("audio_"):
+        context.user_data['audio'] = d.split("_")[1]
+        kb = [
+            [InlineKeyboardButton("📥 Hugging Face Link", callback_data="dest_hf")],
+            [InlineKeyboardButton("🐙 GitHub Link", callback_data="dest_gh")],
+            [InlineKeyboardButton("☁️ Google Drive Link", callback_data="dest_gd")]
         ]
-        await query.edit_message_text("Where do you want to upload the video?", reply_markup=InlineKeyboardMarkup(keyboard))
-
-    elif data.startswith("dest_"):
-        destination = data.split("_")[1]
-        anime_id = context.user_data['anime_id']
-        title = context.user_data['selected_title']
-        ep_num = context.user_data['selected_ep']
-        audio_type = context.user_data['audio_type']
-        chat_id = query.message.chat_id
-        
-        await query.edit_message_text("⏳ **Extracting stream...**")
-        stream_url, headers = await asyncio.to_thread(extract_stream, anime_id, ep_num, audio_type)
-        
-        if not stream_url:
-            await query.edit_message_text("❌ Could not extract stream URL.")
-            return
-        
+        await q.edit_message_text("Choose storage destination:", reply_markup=InlineKeyboardMarkup(kb))
+    elif d.startswith("dest_"):
+        dest = d.split("_")[1]; aid, title, ep, audio, chat_id = context.user_data['aid'], context.user_data['title'], context.user_data['ep'], context.user_data['audio'], q.message.chat_id
+        await q.edit_message_text("⏳ Extracting stream...")
+        url, headers = await asyncio.to_thread(extract_stream, aid, ep, audio)
+        if not url: await q.edit_message_text("❌ Extract failed."); return
         safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip().replace(" ", "_")
-        filename = f"{safe_title}_EP{ep_num}_{audio_type.upper()}.mp4"
-        output_file = f"/tmp/{filename}"
+        filename = f"{safe_title}_EP{ep}_{audio.upper()}.mp4"
+        out = f"/tmp/{filename}"
+        await q.edit_message_text("⏳ Downloading (original quality)...")
+        if not await asyncio.to_thread(download_with_ytdlp, url, out, headers):
+            await q.edit_message_text("❌ Download failed."); return
         
-        await query.edit_message_text("⏳ **Downloading (original quality)...**")
-        success = await asyncio.to_thread(download_with_ytdlp, stream_url, output_file, headers)
+        size_mb = os.path.getsize(out) / (1024 * 1024)
+        await q.edit_message_text(f"🧹 Running cleanup & 📤 Uploading to {dest.upper()} ({size_mb:.1f} MB)...")
         
-        if not success:
-            await query.edit_message_text("❌ Download failed.")
-            return
-        
-        file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
-        caption = f"**{title}** — EP {ep_num} ({audio_type.upper()})"
-        
-        await query.edit_message_text(f"📤 **Uploading to {destination.upper()} ({file_size_mb:.1f} MB)...**")
-        
-        if destination == "telegram":
-            success = await asyncio.to_thread(upload_telegram_document, chat_id, output_file, caption)
-            if success:
-                await query.edit_message_text("✅ Uploaded to Telegram as a Document.")
-            else:
-                await query.edit_message_text("❌ Telegram upload failed.")
-                
-        elif destination == "github":
-            link_or_err = await asyncio.to_thread(upload_github_release, output_file, filename)
-            if link_or_err.startswith("http"):
-                await query.edit_message_text(
-                    f"✅ **Uploaded to GitHub!**\n\n"
-                    f"{caption}\nFile size: {file_size_mb:.1f} MB\n\n"
-                    f"🐙 [Click here to download from GitHub]({link_or_err})\n\n"
-                    f"*Scroll down on the page and click `{filename}` to start downloading.*",
-                    disable_web_page_preview=True
-                )
-            else:
-                await query.edit_message_text(f"❌ {link_or_err}")
-                
-        elif destination == "gdrive":
-            link_or_err = await asyncio.to_thread(upload_gdrive, output_file, filename)
-            if link_or_err.startswith("http"):
-                await query.edit_message_text(
-                    f"✅ **Uploaded to Google Drive!**\n\n"
-                    f"{caption}\nFile size: {file_size_mb:.1f} MB\n\n"
-                    f"☁️ [Click here to download from Google Drive]({link_or_err})\n\n"
-                    f"*Note: If Google shows a virus warning because it's a large file, click `Download anyway`.*",
-                    disable_web_page_preview=True
-                )
-            else:
-                await query.edit_message_text(f"❌ {link_or_err}")
-        
-        if os.path.exists(output_file): os.remove(output_file)
+        await asyncio.to_thread(cleanup_hf)
+        await asyncio.to_thread(cleanup_github)
+        await asyncio.to_thread(cleanup_gdrive)
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Update {update} caused error {context.error}")
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(f"⚠️ An error occurred: {str(context.error)[:200]}")
-        except Exception:
-            pass
+        if dest == "hf":
+            link = await asyncio.to_thread(upload_to_hf, out, filename)
+            if link: await q.edit_message_text(f"✅ **Hugging Face Link Ready**\n\n📥 [Click here to download]({link})", disable_web_page_preview=True)
+            else: await q.edit_message_text("❌ HF upload failed.")
+        elif dest == "gh":
+            link = await asyncio.to_thread(upload_github_release, out, filename)
+            if link: await q.edit_message_text(f"✅ **GitHub Release Link Ready**\n\n🐙 [Click here to download]({link})", disable_web_page_preview=True)
+            else: await q.edit_message_text("❌ GitHub upload failed.")
+        elif dest == "gd":
+            link = await asyncio.to_thread(upload_gdrive, out, filename)
+            if link: await q.edit_message_text(f"✅ **Google Drive Link Ready**\n\n☁️ [Click here to download]({link})\n\n*If GDrive shows a virus warning, click `Download anyway`.*", disable_web_page_preview=True)
+            else: await q.edit_message_text("❌ GDrive upload failed. Check your OAuth settings.")
+        
+        os.remove(out)
 
-# --- Main Entry Point ---
+async def error_handler(update, context):
+    logger.error(f"Error: {context.error}")
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -439,14 +309,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_anime))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_error_handler(error_handler)
-
-    webhook_url = f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}"
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=BOT_TOKEN,
-        webhook_url=webhook_url
-    )
+    app.run_webhook(listen="0.0.0.0", port=PORT, url_path=BOT_TOKEN, webhook_url=f"{RENDER_EXTERNAL_URL}/{BOT_TOKEN}")
 
 if __name__ == '__main__':
     main()
