@@ -13,6 +13,13 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from huggingface_hub import HfApi
 
+# Import gogoanimeapi for guaranteed English dubs
+try:
+    from gogoanimeapi import gogoanime as gogo
+except ImportError:
+    gogo = None
+    logging.warning("gogoanimeapi not installed. Dub downloads will fall back to Kuhi/MegaPlay.")
+
 # Google API imports
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -102,76 +109,58 @@ def get_episodes(anime_id):
     except Exception as e:
         logger.error(f"Episode error: {e}"); return []
 
-def extract_dub_from_megaplay(anilist_id, episode):
-    """Directly constructs and extracts the dub stream from MegaPlay."""
-    iframe_url = f"https://megaplay.buzz/stream/ani/{anilist_id}/{episode}/dub"
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://megaplay.buzz/"}
+def extract_dub_from_gogo(title, episode_num, quality):
+    """Use gogoanimeapi to find and download English dub MP4 link."""
+    if not gogo:
+        return None, "gogoanimeapi not installed."
     try:
-        resp = requests.get(iframe_url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        html = resp.text
-        # Look for the m3u8 URL in the page source
-        m3u8_match = re.search(r'https?://[^\s"\']+\.m3u8[^\s"\']*', html)
-        if m3u8_match:
-            return m3u8_match.group(0), headers
-        # Fallback: look for file: "..." pattern
-        file_match = re.search(r'file\s*:\s*["\']([^"\']+)["\']', html)
-        if file_match:
-            return file_match.group(1), headers
-        return None, None
+        # Search for the dub version
+        search_results = gogo.get_search_results(query=f"{title} (Dub)")
+        if not search_results:
+            # Try without "(Dub)" in case the title already includes it
+            search_results = gogo.get_search_results(query=title)
+        
+        dub_id = None
+        for result in search_results:
+            if "(Dub)" in result.get("name", ""):
+                dub_id = result.get("animeid")
+                break
+        
+        if not dub_id:
+            return None, "No English dub found on GogoAnime."
+            
+        # Get episode links
+        links = gogo.get_episodes_link(animeid=dub_id, episode_num=episode_num)
+        if not links or "status" in links:
+            return None, f"Could not fetch download links: {links.get('reason', 'Unknown')}"
+            
+        # Select quality
+        quality_key = "(720P-mp4)" if quality == "720" else "(480P-mp4)" if quality == "480" else "(360P-mp4)"
+        stream_url = links.get(quality_key) or links.get("(720P-mp4)") or links.get("(360P-mp4)")
+        
+        if not stream_url:
+            return None, "No MP4 link available for this quality."
+            
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://gogoanime.com/"}
+        return stream_url, headers, None, None # No error
+        
     except Exception as e:
-        logger.error(f"MegaPlay dub extraction error: {e}")
-        return None, None
+        logger.error(f"GogoAnime dub error: {e}")
+        return None, str(e)
 
-def extract_stream_and_subs(anime_id, ep, audio, quality):
-    """Extracts stream and subtitles. For dub, uses direct MegaPlay URL."""
+def extract_stream_and_subs(anime_id, ep, audio, quality, title):
+    """Returns (stream_url, headers, subtitle_url, error)"""
     sub_url = None
     headers = None
     stream_url = None
     
     if audio == "dub":
-        # Force direct MegaPlay extraction for guaranteed English audio
-        stream_url, headers = extract_dub_from_megaplay(anime_id, ep)
-        if not stream_url:
-            return None, None, None, "Dub stream not found on MegaPlay."
-    else:
-        # Use Kuhi API for sub
+        # Use GogoAnime for guaranteed English audio
+        stream_url, headers, sub_url, err = extract_dub_from_gogo(title, ep, quality)
+        if err:
+            return None, None, None, f"Dub error: {err}"
+        # Still try to get subtitles from Kuhi (sub type)
         try:
-            params = {"e": ep, "type": "sub", "quality": quality}
-            resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=90)
-            resp.raise_for_status()
-            data = resp.json()
-            streams = data.get("streams", [])
-            subtitles = data.get("subtitles", []) or data.get("tracks", [])
-            
-            # Find English subtitle
-            for track in subtitles:
-                lang = track.get("lang", track.get("language", "")).lower()
-                label = track.get("label", "").lower()
-                if "en" in lang or "english" in label:
-                    sub_url = track.get("url", track.get("file"))
-                    break
-                    
-            if streams:
-                # Filter by quality
-                best_stream = None
-                for s in streams:
-                    s_qual = str(s.get("quality", ""))
-                    if quality in s_qual or s_qual == quality:
-                        best_stream = s
-                        break
-                if not best_stream:
-                    best_stream = streams[0]
-                stream_url = best_stream.get("url")
-                headers = {"Referer": best_stream.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
-        except Exception as e:
-            logger.error(f"Kuhi sub extraction error: {e}")
-            return None, None, None, "Sub extraction failed."
-            
-    # For dub, we still want subtitles. Try to get them from Kuhi API.
-    if audio == "dub" and not sub_url:
-        try:
-            # Request sub type just for subtitles
             params = {"e": ep, "type": "sub"}
             resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=30)
             if resp.ok:
@@ -185,6 +174,37 @@ def extract_stream_and_subs(anime_id, ep, audio, quality):
                         break
         except Exception:
             pass
+    else:
+        # Use Kuhi for sub
+        try:
+            params = {"e": ep, "type": "sub", "quality": quality}
+            resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=90)
+            resp.raise_for_status()
+            data = resp.json()
+            streams = data.get("streams", [])
+            subtitles = data.get("subtitles", []) or data.get("tracks", [])
+            
+            for track in subtitles:
+                lang = track.get("lang", track.get("language", "")).lower()
+                label = track.get("label", "").lower()
+                if "en" in lang or "english" in label:
+                    sub_url = track.get("url", track.get("file"))
+                    break
+                    
+            if streams:
+                best_stream = None
+                for s in streams:
+                    s_qual = str(s.get("quality", ""))
+                    if quality in s_qual or s_qual == quality:
+                        best_stream = s
+                        break
+                if not best_stream:
+                    best_stream = streams[0]
+                stream_url = best_stream.get("url")
+                headers = {"Referer": best_stream.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
+        except Exception as e:
+            logger.error(f"Kuhi sub extraction error: {e}")
+            return None, None, None, "Sub extraction failed."
             
     return stream_url, headers, sub_url, None
 
@@ -370,7 +390,7 @@ async def process_download(q, context, dest):
     chat_id = q.message.chat_id
     
     await q.edit_message_text("⏳ Extracting stream & subtitles...")
-    url, headers, sub_url, err = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio, qual)
+    url, headers, sub_url, err = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio, qual, title)
     
     if err:
         await q.edit_message_text(f"❌ {err}")
@@ -393,7 +413,7 @@ async def process_download(q, context, dest):
         if sub_sent:
             await q.edit_message_text("✅ Subtitle sent successfully.")
         else:
-            await q.edit_message_text("❌ Failed to download or send subtitle. The source may not have one.")
+            await q.edit_message_text("❌ Failed to download or send subtitle.")
         return
 
     # 2. Download and Upload Video
