@@ -13,13 +13,6 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from huggingface_hub import HfApi
 
-# Import gogoanimeapi (package name: gogoanime-api)
-try:
-    from gogoanimeapi import gogoanime as gogo
-except ImportError:
-    gogo = None
-    logging.warning("gogoanime-api not installed. Dub downloads will fall back to Kuhi/MegaPlay.")
-
 # Google API imports
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -91,7 +84,11 @@ def search_kuhi(query):
     try:
         resp = session.get(f"{KUHI_API}/anime/search", params={"query": query, "page": 1, "per_page": 10}, timeout=60)
         resp.raise_for_status()
-        return resp.json().get("results", [])
+        results = resp.json().get("results", [])
+        # Store the Anikoto URL for each result so we can use anikoto CLI later
+        for r in results:
+            r['anikoto_url'] = r.get('url') or f"https://anikoto.tv/watch/{r.get('slug')}"
+        return results
     except Exception as e:
         logger.error(f"Search error: {e}"); return []
 
@@ -109,57 +106,42 @@ def get_episodes(anime_id):
     except Exception as e:
         logger.error(f"Episode error: {e}"); return []
 
-def extract_dub_from_gogo(title, episode_num, quality):
-    """Use gogoanime-api to find and download English dub MP4 link."""
-    if not gogo:
-        return None, "gogoanime-api not installed."
-    try:
-        # Search for the dub version
-        search_results = gogo.get_search_results(query=f"{title} (Dub)")
-        if not search_results:
-            # Try without "(Dub)" in case the title already includes it
-            search_results = gogo.get_search_results(query=title)
-        
-        dub_id = None
-        for result in search_results:
-            if "(Dub)" in result.get("name", ""):
-                dub_id = result.get("animeid")
-                break
-        
-        if not dub_id:
-            return None, "No English dub found on GogoAnime."
-            
-        # Get episode links
-        links = gogo.get_episodes_link(animeid=dub_id, episode_num=episode_num)
-        if not links or "status" in links:
-            return None, f"Could not fetch download links: {links.get('reason', 'Unknown')}"
-            
-        # Select quality
-        quality_key = "(720P-mp4)" if quality == "720" else "(480P-mp4)" if quality == "480" else "(360P-mp4)"
-        stream_url = links.get(quality_key) or links.get("(720P-mp4)") or links.get("(360P-mp4)")
-        
-        if not stream_url:
-            return None, "No MP4 link available for this quality."
-            
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://gogoanime.com/"}
-        return stream_url, headers, None, None # No error
-        
-    except Exception as e:
-        logger.error(f"GogoAnime dub error: {e}")
-        return None, str(e)
+def download_dub_with_anikoto(anikoto_url, ep_num, quality, output_dir):
+    """Use anikoto CLI to download a specific dub episode."""
+    cmd = [
+        "anikoto", anikoto_url,
+        "--audio", "dub",
+        "--quality", quality,
+        "--range", f"{ep_num}-{ep_num}",
+        "--path", output_dir,
+        "--source", "megaplay"
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"anikoto CLI error: {result.stderr}")
+        return None, result.stderr
+    # Find the downloaded file
+    for f in os.listdir(output_dir):
+        if f.endswith(".mp4"):
+            return os.path.join(output_dir, f), None
+    return None, "Downloaded file not found."
 
-def extract_stream_and_subs(anime_id, ep, audio, quality, title):
+def extract_stream_and_subs(anime_id, ep, audio, quality, title, anikoto_url):
     """Returns (stream_url, headers, subtitle_url, error)"""
     sub_url = None
     headers = None
     stream_url = None
     
     if audio == "dub":
-        # Use GogoAnime for guaranteed English audio
-        stream_url, headers, sub_url, err = extract_dub_from_gogo(title, ep, quality)
+        # Use anikoto CLI to download the dub video directly
+        temp_dir = f"/tmp/anikoto_{uuid.uuid4().hex}"
+        os.makedirs(temp_dir, exist_ok=True)
+        video_path, err = download_dub_with_anikoto(anikoto_url, ep, quality, temp_dir)
         if err:
             return None, None, None, f"Dub error: {err}"
-        # Still try to get subtitles from Kuhi (sub type)
+        stream_url = video_path # This is a local file path, not a URL
+        headers = {} # Not needed for local file
+        # Get subtitles from Kuhi (sub type)
         try:
             params = {"e": ep, "type": "sub"}
             resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=30)
@@ -209,6 +191,11 @@ def extract_stream_and_subs(anime_id, ep, audio, quality, title):
     return stream_url, headers, sub_url, None
 
 def download_with_ytdlp(stream_url, output_path, headers):
+    # If stream_url is a local file (dub path), just copy it
+    if os.path.exists(stream_url):
+        import shutil
+        shutil.move(stream_url, output_path)
+        return True
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
     referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
     origin = referer.rstrip('/')
@@ -339,11 +326,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer(); d = q.data
     if d.startswith("anime_"):
         idx = int(d.split("_")[1]); anime = context.user_data['results'][idx]
-        aid = anime.get('id') or anime.get('anime_id'); title = get_text(anime.get('title', anime.get('name', 'Anime')))
+        aid = anime.get('id') or anime.get('anime_id')
+        title = get_text(anime.get('title', anime.get('name', 'Anime')))
+        anikoto_url = anime.get('anikoto_url', '')
         await q.edit_message_text(f"📺 **{title}**\nFetching episodes...")
         eps = await asyncio.to_thread(get_episodes, aid)
         if not eps: await q.edit_message_text("❌ No episodes."); return
-        context.user_data['aid'], context.user_data['title'], context.user_data['eps'] = aid, title, eps
+        context.user_data['aid'], context.user_data['title'], context.user_data['eps'], context.user_data['anikoto_url'] = aid, title, eps, anikoto_url
         await q.edit_message_text(f"**{title}**\nPage 1:", reply_markup=build_episode_keyboard(eps))
         
     elif d.startswith("page_"):
@@ -387,10 +376,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_download(q, context, dest):
     aid, title, ep, audio, qual = context.user_data['aid'], context.user_data['title'], context.user_data['ep'], context.user_data['audio'], context.user_data['qual']
+    anikoto_url = context.user_data['anikoto_url']
     chat_id = q.message.chat_id
     
     await q.edit_message_text("⏳ Extracting stream & subtitles...")
-    url, headers, sub_url, err = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio, qual, title)
+    url, headers, sub_url, err = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio, qual, title, anikoto_url)
     
     if err:
         await q.edit_message_text(f"❌ {err}")
