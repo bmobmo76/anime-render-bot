@@ -13,12 +13,12 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from huggingface_hub import HfApi
 
-# Import gogoanimeapi for guaranteed English dubs
+# Import gogoanimeapi (package name: gogoanime-api)
 try:
     from gogoanimeapi import gogoanime as gogo
 except ImportError:
     gogo = None
-    logging.warning("gogoanimeapi not installed. Dub downloads will fall back to Kuhi/MegaPlay.")
+    logging.warning("gogoanime-api not installed. Dub downloads will fall back to Kuhi/MegaPlay.")
 
 # Google API imports
 from google.oauth2.credentials import Credentials
@@ -110,9 +110,9 @@ def get_episodes(anime_id):
         logger.error(f"Episode error: {e}"); return []
 
 def extract_dub_from_gogo(title, episode_num, quality):
-    """Use gogoanimeapi to find and download English dub MP4 link."""
+    """Use gogoanime-api to find and download English dub MP4 link."""
     if not gogo:
-        return None, "gogoanimeapi not installed."
+        return None, "gogoanime-api not installed."
     try:
         # Search for the dub version
         search_results = gogo.get_search_results(query=f"{title} (Dub)")
