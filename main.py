@@ -84,11 +84,7 @@ def search_kuhi(query):
     try:
         resp = session.get(f"{KUHI_API}/anime/search", params={"query": query, "page": 1, "per_page": 10}, timeout=60)
         resp.raise_for_status()
-        results = resp.json().get("results", [])
-        # Store the Anikoto URL for each result so we can use anikoto CLI later
-        for r in results:
-            r['anikoto_url'] = r.get('url') or f"https://anikoto.tv/watch/{r.get('slug')}"
-        return results
+        return resp.json().get("results", [])
     except Exception as e:
         logger.error(f"Search error: {e}"); return []
 
@@ -106,96 +102,78 @@ def get_episodes(anime_id):
     except Exception as e:
         logger.error(f"Episode error: {e}"); return []
 
-def download_dub_with_anikoto(anikoto_url, ep_num, quality, output_dir):
-    """Use anikoto CLI to download a specific dub episode."""
-    cmd = [
-        "anikoto", anikoto_url,
-        "--audio", "dub",
-        "--quality", quality,
-        "--range", f"{ep_num}-{ep_num}",
-        "--path", output_dir,
-        "--source", "megaplay"
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.error(f"anikoto CLI error: {result.stderr}")
-        return None, result.stderr
-    # Find the downloaded file
-    for f in os.listdir(output_dir):
-        if f.endswith(".mp4"):
-            return os.path.join(output_dir, f), None
-    return None, "Downloaded file not found."
-
-def extract_stream_and_subs(anime_id, ep, audio, quality, title, anikoto_url):
+def extract_stream_and_subs(anime_id, ep, audio, quality):
     """Returns (stream_url, headers, subtitle_url, error)"""
     sub_url = None
     headers = None
     stream_url = None
     
-    if audio == "dub":
-        # Use anikoto CLI to download the dub video directly
-        temp_dir = f"/tmp/anikoto_{uuid.uuid4().hex}"
-        os.makedirs(temp_dir, exist_ok=True)
-        video_path, err = download_dub_with_anikoto(anikoto_url, ep, quality, temp_dir)
-        if err:
-            return None, None, None, f"Dub error: {err}"
-        stream_url = video_path # This is a local file path, not a URL
-        headers = {} # Not needed for local file
-        # Get subtitles from Kuhi (sub type)
+    # For dubs, we must try multiple providers and strictly verify the audio metadata
+    providers_to_try = ["anineko", "animepahe", "zoro", "gogoanime"] if audio == "dub" else [None]
+    
+    for provider in providers_to_try:
         try:
-            params = {"e": ep, "type": "sub"}
-            resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=30)
-            if resp.ok:
-                data = resp.json()
-                subtitles = data.get("subtitles", []) or data.get("tracks", [])
+            params = {"e": ep, "type": audio, "quality": quality}
+            if provider:
+                params["provider"] = provider
+                
+            resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=60)
+            
+            if resp.status_code == 404:
+                continue # Try next provider
+                
+            resp.raise_for_status()
+            data = resp.json()
+            
+            streams = data.get("streams", [])
+            subtitles = data.get("subtitles", []) or data.get("tracks", [])
+            
+            # Find English subtitle (only if we don't have one yet)
+            if not sub_url:
                 for track in subtitles:
                     lang = track.get("lang", track.get("language", "")).lower()
                     label = track.get("label", "").lower()
                     if "en" in lang or "english" in label:
                         sub_url = track.get("url", track.get("file"))
                         break
-        except Exception:
-            pass
-    else:
-        # Use Kuhi for sub
-        try:
-            params = {"e": ep, "type": "sub", "quality": quality}
-            resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=90)
-            resp.raise_for_status()
-            data = resp.json()
-            streams = data.get("streams", [])
-            subtitles = data.get("subtitles", []) or data.get("tracks", [])
-            
-            for track in subtitles:
-                lang = track.get("lang", track.get("language", "")).lower()
-                label = track.get("label", "").lower()
-                if "en" in lang or "english" in label:
-                    sub_url = track.get("url", track.get("file"))
-                    break
-                    
+                        
             if streams:
-                best_stream = None
+                # Strict verification for dubs
                 for s in streams:
+                    s_audio = str(s.get("audio", "")).lower()
+                    # If we requested dub, ensure the stream is actually a dub
+                    if audio == "dub" and not ("dub" in s_audio or "eng" in s_audio):
+                        continue
+                        
                     s_qual = str(s.get("quality", ""))
                     if quality in s_qual or s_qual == quality:
-                        best_stream = s
+                        stream_url = s.get("url")
+                        headers = {"Referer": s.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
                         break
-                if not best_stream:
-                    best_stream = streams[0]
-                stream_url = best_stream.get("url")
-                headers = {"Referer": best_stream.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
+                        
+                # If quality didn't match, just take the first verified stream
+                if not stream_url:
+                    for s in streams:
+                        s_audio = str(s.get("audio", "")).lower()
+                        if audio == "dub" and not ("dub" in s_audio or "eng" in s_audio):
+                            continue
+                        stream_url = s.get("url")
+                        headers = {"Referer": s.get("referer", "https://megaplay.buzz/"), "User-Agent": "Mozilla/5.0"}
+                        break
+                        
+            if stream_url:
+                break # We found a valid stream, stop looping through providers
+                
         except Exception as e:
-            logger.error(f"Kuhi sub extraction error: {e}")
-            return None, None, None, "Sub extraction failed."
+            logger.error(f"Extraction error with provider {provider}: {e}")
+            continue
             
+    if not stream_url:
+        return None, None, sub_url, "Could not find a valid stream for the selected audio type."
+        
     return stream_url, headers, sub_url, None
 
 def download_with_ytdlp(stream_url, output_path, headers):
-    # If stream_url is a local file (dub path), just copy it
-    if os.path.exists(stream_url):
-        import shutil
-        shutil.move(stream_url, output_path)
-        return True
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
     referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
     origin = referer.rstrip('/')
@@ -326,13 +304,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer(); d = q.data
     if d.startswith("anime_"):
         idx = int(d.split("_")[1]); anime = context.user_data['results'][idx]
-        aid = anime.get('id') or anime.get('anime_id')
-        title = get_text(anime.get('title', anime.get('name', 'Anime')))
-        anikoto_url = anime.get('anikoto_url', '')
+        aid = anime.get('id') or anime.get('anime_id'); title = get_text(anime.get('title', anime.get('name', 'Anime')))
         await q.edit_message_text(f"📺 **{title}**\nFetching episodes...")
         eps = await asyncio.to_thread(get_episodes, aid)
         if not eps: await q.edit_message_text("❌ No episodes."); return
-        context.user_data['aid'], context.user_data['title'], context.user_data['eps'], context.user_data['anikoto_url'] = aid, title, eps, anikoto_url
+        context.user_data['aid'], context.user_data['title'], context.user_data['eps'] = aid, title, eps
         await q.edit_message_text(f"**{title}**\nPage 1:", reply_markup=build_episode_keyboard(eps))
         
     elif d.startswith("page_"):
@@ -376,11 +352,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_download(q, context, dest):
     aid, title, ep, audio, qual = context.user_data['aid'], context.user_data['title'], context.user_data['ep'], context.user_data['audio'], context.user_data['qual']
-    anikoto_url = context.user_data['anikoto_url']
     chat_id = q.message.chat_id
     
     await q.edit_message_text("⏳ Extracting stream & subtitles...")
-    url, headers, sub_url, err = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio, qual, title, anikoto_url)
+    url, headers, sub_url, err = await asyncio.to_thread(extract_stream_and_subs, aid, ep, audio, qual)
     
     if err:
         await q.edit_message_text(f"❌ {err}")
