@@ -102,7 +102,6 @@ def get_episodes(anime_id):
         logger.error(f"Episode error: {e}"); return []
 
 def extract_stream_and_subs(anime_id, ep, audio, quality):
-    """Returns (stream_url, headers, subtitle_url)"""
     try:
         params = {"e": ep, "type": audio, "quality": quality}
         resp = session.get(f"{KUHI_API}/anime/extract/{anime_id}", params=params, timeout=90)
@@ -140,20 +139,18 @@ def extract_stream_and_subs(anime_id, ep, audio, quality):
         
     return None, None, None
 
-def download_with_ytdlp(stream_url, output_path, headers, audio_type):
+def download_with_ytdlp(stream_url, output_path, headers):
     user_agent = headers.get("User-Agent", "Mozilla/5.0") if headers else "Mozilla/5.0"
     referer = headers.get("Referer", "https://megaplay.buzz/") if headers else "https://megaplay.buzz/"
     origin = referer.rstrip('/')
     
-    # Force the correct audio track if possible (eng for dub, jpn for sub)
-    audio_lang = "eng" if audio_type == "dub" else "jpn"
-    format_str = f"bestvideo[ext=mp4]+bestaudio[language={audio_lang}]/bestvideo+bestaudio/best"
-    
+    # REMOVED the forced [language=eng] filter. 
+    # The Kuhi API already gives us a stream URL specific to the requested audio type.
     cmd = [
         "yt-dlp", "--no-warnings", "--no-check-certificate",
         "--referer", referer, "--user-agent", user_agent,
         "--add-header", f"Origin:{origin}",
-        "-f", format_str,
+        "-f", "bestvideo+bestaudio/best", 
         "--merge-output-format", "mp4", "-o", output_path, stream_url
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -167,6 +164,7 @@ def download_with_ytdlp(stream_url, output_path, headers, audio_type):
 
 def download_subtitle(sub_url, output_path, headers):
     try:
+        # Use the same headers that the video stream uses to bypass the CDN block
         resp = requests.get(sub_url, headers=headers, timeout=30)
         resp.raise_for_status()
         with open(output_path, "wb") as f:
@@ -308,7 +306,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = d.split("_")[1]
         context.user_data['mode'] = mode
         if mode == "sub":
-            # Trigger subtitle-only download immediately
             await process_download(q, context, dest="sub_only")
         else:
             kb = [
@@ -331,7 +328,7 @@ async def process_download(q, context, dest):
     
     safe_title = "".join(c for c in title if c.isalnum() or c in " -_").strip().replace(" ", "_")
     
-    # 1. Download and Send Subtitle
+    # 1. Download and Send Subtitle (Before Video)
     sub_sent = False
     if sub_url:
         sub_filename = f"{safe_title}_EP{ep}_{audio.upper()}.srt"
@@ -346,7 +343,7 @@ async def process_download(q, context, dest):
         if sub_sent:
             await q.edit_message_text("✅ Subtitle sent successfully.")
         else:
-            await q.edit_message_text("❌ Failed to download or send subtitle.")
+            await q.edit_message_text("❌ Failed to download or send subtitle. The source may not have one.")
         return
 
     # 2. Download and Upload Video
@@ -358,7 +355,7 @@ async def process_download(q, context, dest):
     out = f"/tmp/{filename}"
     
     await q.edit_message_text("⏳ Downloading video (this may take a while)...")
-    if not await asyncio.to_thread(download_with_ytdlp, url, out, headers, audio):
+    if not await asyncio.to_thread(download_with_ytdlp, url, out, headers):
         await q.edit_message_text("❌ Video download failed."); return
     
     size_mb = os.path.getsize(out) / (1024 * 1024)
